@@ -1,0 +1,4 @@
+# Cloudflare Pages SPA Routing Rules
+# 1. API routes are handled by Cloudflare Pages Functions in /functions/api
+# 2. All client SPA routes (/landing, /crm, /portal, etc.) serve index.html with HTTP 200
+/*    /index.html   200

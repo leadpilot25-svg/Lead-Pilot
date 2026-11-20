@@ -1,0 +1,9 @@
+name = "leadpilot-staging"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = "dist"
+
+[vars]
+ENVIRONMENT = "staging"
+FIREBASE_PROJECT_ID = "bamboo-tangent-x8gvj"
+FIRESTORE_DATABASE_ID = "ai-studio-adaa6756-a579-4944-874a-1f7ccb196d2b"

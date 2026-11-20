@@ -1,0 +1,30 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Local AI Studio workspace
+.aistudio/
+
+# Generated production builds
+dist-crm/
+dist-landing/
+
+# Local backups and recovery files
+*.corrupted-backup
+*.zip-recovery
+*.before-slug-fix
+
+# Local archives and debug files
+*.zip
+firestore-debug.log
+
+# Local Firebase configuration
+firebase-applet-config.json
+
+# Local Firebase configuration
+firebase-applet-config.json

@@ -1,0 +1,436 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default Deny: Catch-all to block all unmapped collections
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ==========================================
+    // 1. Identity & Helper Functions
+    // ==========================================
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_-]+$');
+    }
+
+    // Root platform administrator: cryptographically verified Google identity
+    function isRootAdmin() {
+      return isSignedIn() &&
+        request.auth.token.email == 'mail.nasiya@gmail.com' &&
+        request.auth.token.email_verified == true &&
+        request.auth.token.firebase.sign_in_provider == 'google.com';
+    }
+
+    // Global administrator: Root admin OR provisioned in /admins/{uid}
+    function isAdmin() {
+      return isRootAdmin() ||
+        (isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    // Tenant Active Gate: Tenant document must exist, have a 'status' field, and status must equal exactly 'active'
+    function isTenantActive(tenantId) {
+      return exists(/databases/$(database)/documents/tenants/$(tenantId)) &&
+        ('status' in get(/databases/$(database)/documents/tenants/$(tenantId)).data) &&
+        get(/databases/$(database)/documents/tenants/$(tenantId)).data.status == 'active';
+    }
+
+    // Master Gate: Validates membership strictly via tenant members subcollection
+    // Ordinary members require an active tenant; Root/Global Admin retains administrative access
+    function isTenantMember(tenantId) {
+      return isSignedIn() && isValidId(tenantId) && (
+        isAdmin() ||
+        (
+          isTenantActive(tenantId) &&
+          exists(/databases/$(database)/documents/tenants/$(tenantId)/members/$(request.auth.uid))
+        )
+      );
+    }
+
+    // Tenant Owner Gate: Verifies member holds the 'owner' role in this tenant
+    // Ordinary owners require an active tenant; Root/Global Admin retains administrative access
+    function isTenantOwner(tenantId) {
+      return isSignedIn() && isValidId(tenantId) && (
+        isAdmin() ||
+        (
+          isTenantActive(tenantId) &&
+          exists(/databases/$(database)/documents/tenants/$(tenantId)/members/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/tenants/$(tenantId)/members/$(request.auth.uid)).data.role == 'owner'
+        )
+      );
+    }
+
+    function isReservedSlug(slug) {
+      return slug in ['crm', 'portal', 'admin', 'api', 'assets', 'downloads', 'site', 'landing'];
+    }
+
+    // ==========================================
+    // 2. Schema Validation Helpers
+    // ==========================================
+
+    function isValidUserProfile(data) {
+      return data.keys().hasOnly(['uid', 'email', 'displayName', 'businessName', 'tenantId', 'role', 'createdAt']) &&
+             data.uid is string && data.uid.size() > 0 && data.uid.size() <= 128 &&
+             data.email is string && data.email.size() <= 150 &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 100)) &&
+             (!('businessName' in data) || (data.businessName is string && data.businessName.size() <= 150)) &&
+             (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 50));
+    }
+
+    // Member schema for Root Administrator (can assign 'owner' or 'staff')
+    function isValidMemberData(data, memberUid) {
+      return data.keys().hasAll(['role', 'uid']) &&
+             data.keys().hasOnly(['role', 'uid', 'email', 'addedAt']) &&
+             data.uid == memberUid &&
+             (data.role == 'owner' || data.role == 'staff') &&
+             (!('email' in data) || (data.email is string && data.email.size() <= 150)) &&
+             (!('addedAt' in data) || (data.addedAt is string && data.addedAt.size() <= 50));
+    }
+
+    // Member schema for Tenant Owner (can ONLY assign 'staff')
+    function isValidStaffMemberData(data, memberUid) {
+      return isValidMemberData(data, memberUid) && data.role == 'staff';
+    }
+
+    // Public Landing Page Lead Validation (Strict 13-Field Allowlist; NO CRM fields)
+    function isValidPublicLeadSubmission(data) {
+      return data.keys().hasAll(['id', 'timestamp', 'clientId', 'name', 'phone', 'service', 'status']) &&
+             data.keys().hasOnly([
+               'id', 'timestamp', 'clientId', 'businessName',
+               'name', 'phone', 'email', 'service', 'details',
+               'address', 'leadSource', 'pageUrl', 'status'
+             ]) &&
+             data.status == 'New' &&
+             data.id is string && data.id.size() <= 128 &&
+             data.clientId is string && data.clientId.size() <= 128 &&
+             data.timestamp is string && data.timestamp.size() <= 50 &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 150 &&
+             data.phone is string && data.phone.size() > 0 && data.phone.size() <= 50 &&
+             data['service'] is string && data['service'].size() <= 200 &&
+             (!('email' in data) || data.email == null || (data.email is string && data.email.size() <= 150)) &&
+             (!('details' in data) || (data.details is string && data.details.size() <= 1500)) &&
+             (!('address' in data) || (data.address is string && data.address.size() <= 250)) &&
+             (!('businessName' in data) || (data.businessName is string && data.businessName.size() <= 150)) &&
+             (!('leadSource' in data) || (data.leadSource is string && data.leadSource.size() <= 150)) &&
+             (!('pageUrl' in data) || (data.pageUrl is string && data.pageUrl.size() <= 300));
+    }
+
+    // Authenticated CRM Lead Validation (Allows notes, contactLogs, contactCount, followUpDate, status progression)
+    function isValidCrmLeadData(data) {
+      return data.keys().hasOnly([
+               'id', 'timestamp', 'clientId', 'businessName',
+               'name', 'phone', 'email', 'service', 'details',
+               'address', 'leadSource', 'pageUrl', 'status',
+               'notes', 'followUpDate', 'lastContacted', 'lastContactMethod',
+               'contactCount', 'contactLogs'
+             ]) &&
+             data.id is string && data.id.size() <= 128 &&
+             data.clientId is string && data.clientId.size() <= 128 &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 150 &&
+             data.phone is string && data.phone.size() > 0 && data.phone.size() <= 50 &&
+             (!('timestamp' in data) || (data.timestamp is string && data.timestamp.size() <= 50)) &&
+             (!('businessName' in data) || (data.businessName is string && data.businessName.size() <= 150)) &&
+             (!('email' in data) || data.email == null || (data.email is string && data.email.size() <= 150)) &&
+             (!('service' in data) || (data['service'] is string && data['service'].size() <= 200)) &&
+             (!('details' in data) || (data.details is string && data.details.size() <= 1500)) &&
+             (!('address' in data) || (data.address is string && data.address.size() <= 250)) &&
+             (!('leadSource' in data) || (data.leadSource is string && data.leadSource.size() <= 150)) &&
+             (!('pageUrl' in data) || (data.pageUrl is string && data.pageUrl.size() <= 300)) &&
+             (!('status' in data) || (data.status in ['New', 'Contacted', 'Follow-up', 'Qualified', 'Won', 'Lost'])) &&
+             (!('notes' in data) || (data.notes is list && data.notes.size() <= 50)) &&
+             (!('followUpDate' in data) || (data.followUpDate is string && data.followUpDate.size() <= 50)) &&
+             (!('lastContacted' in data) || (data.lastContacted is string && data.lastContacted.size() <= 50)) &&
+             (!('lastContactMethod' in data) || (data.lastContactMethod in ['Call', 'WhatsApp', 'SMS', 'Email'])) &&
+             (!('contactCount' in data) || data.contactCount is number) &&
+             (!('contactLogs' in data) || (data.contactLogs is list && data.contactLogs.size() <= 50));
+    }
+
+    // ==========================================
+    // 3. Collection Rules
+    // ==========================================
+
+    // User Profiles
+    match /users/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+
+      // Ordinary users can only create unassigned profiles; assigning roles or tenants requires isAdmin()
+      allow create: if isSignedIn() && isValidUserProfile(request.resource.data) && (
+        isAdmin() ||
+        (
+          request.auth.uid == userId &&
+          request.resource.data.uid == userId &&
+          (!('role' in request.resource.data) || request.resource.data.role == 'unassigned') &&
+          (!('tenantId' in request.resource.data) || request.resource.data.tenantId == '' || request.resource.data.tenantId == null)
+        )
+      );
+
+      // Ordinary users can update basic profile info, but role and tenantId are completely immutable
+      // (Safely accommodates missing/optional role or tenantId on existing legacy profiles)
+      allow update: if isSignedIn() && isValidUserProfile(request.resource.data) && (
+        isAdmin() ||
+        (
+          request.auth.uid == userId &&
+          request.resource.data.uid == resource.data.uid &&
+          request.resource.data.email == resource.data.email &&
+          (!('role' in resource.data) || request.resource.data.role == resource.data.role) &&
+          (!('tenantId' in resource.data) || request.resource.data.tenantId == resource.data.tenantId)
+        )
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // Administrators Collection: Writeable ONLY by Root Administrator
+    match /admins/{adminId} {
+      allow read: if isSignedIn() && (request.auth.uid == adminId || isRootAdmin());
+      allow write: if isRootAdmin();
+    }
+
+    // Tenants Root & Subcollections
+    match /tenants/{tenantId} {
+      allow get: if isValidId(tenantId) && (isTenantMember(tenantId) || isAdmin());
+      allow list: if isAdmin();
+      // Tenant creation: restricted strictly to platform administrators and cannot overwrite existing tenants
+      allow create: if isAdmin() && !exists(/databases/$(database)/documents/tenants/$(tenantId));
+      allow delete: if isAdmin();
+      // Tenant updates: Admin can update all fields; Tenant Owner can update non-status/non-published fields
+      allow update: if isAdmin() || (
+        isTenantOwner(tenantId) &&
+        (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['status', 'isPublished', 'id']))
+      );
+
+      // Dedicated Public Website Configuration Document: /tenants/{tenantId}/public/website
+      // Anonymous visitors may read ONLY this website document when tenant is active and website is published
+      match /public/website {
+        allow get: if isValidId(tenantId) && (
+          isAdmin() ||
+          (
+            isTenantActive(tenantId) &&
+            resource.data.isPublished == true
+          )
+        );
+        allow list: if isAdmin();
+        // Administrator can write to public website content, BUT publishing (isPublished == true) strictly requires the tenant to be active
+        // This prevents a suspended tenant from being published even in status-change race conditions
+        allow write: if isAdmin() && (
+          request.resource.data.isPublished != true || isTenantActive(tenantId)
+        );
+      }
+
+      // Dedicated Private Website Working Draft: /tenants/{tenantId}/private/websiteDraft
+      // Isolated working draft: strictly accessible ONLY by verified Root Admin
+      match /private/websiteDraft {
+        allow read, write: if isAdmin();
+      }
+
+      // Helper to retrieve staff invite document
+      function getStaffInvite(tId, hash) {
+        return get(/databases/$(database)/documents/tenants/$(tId)/invites/$(hash));
+      }
+
+      // Dedicated Pending Invitations Subcollection: /tenants/{tenantId}/invites/{emailHash}
+      // Staff invitations are identified deterministically by the SHA-256 hash of the invited email address
+      match /invites/{emailHash} {
+        // Read: Tenant Owner, Root Admin, or the specific invited user with verified matching email
+        allow get: if isValidId(emailHash) && (
+          isTenantOwner(tenantId) ||
+          isAdmin() ||
+          (
+            isSignedIn() &&
+            request.auth.token.email_verified == true &&
+            resource.data.email == request.auth.token.email
+          )
+        );
+        allow list: if isTenantOwner(tenantId) || isAdmin();
+
+        // Create: Strictly restricted to Tenant Owner
+        // Mandates role: 'staff', status: 'pending', and expiresAt bounded strictly within (request.time, request.time + 7 days]
+        allow create: if isTenantOwner(tenantId) &&
+          isValidId(emailHash) &&
+          request.resource.data.keys().hasAll(['email', 'emailHash', 'role', 'status', 'tenantId', 'invitedBy', 'createdAt', 'expiresAt']) &&
+          request.resource.data.keys().hasOnly(['email', 'emailHash', 'role', 'status', 'tenantId', 'invitedBy', 'createdAt', 'expiresAt', 'claimedBy', 'claimedAt']) &&
+          request.resource.data.role == 'staff' &&
+          request.resource.data.status == 'pending' &&
+          request.resource.data.tenantId == tenantId &&
+          request.resource.data.invitedBy == request.auth.uid &&
+          request.resource.data.emailHash == emailHash &&
+          request.resource.data.expiresAt > request.time &&
+          request.resource.data.expiresAt <= request.time + duration.value(7, 'd') &&
+          !exists(/databases/$(database)/documents/tenants/$(tenantId)/invites/$(emailHash));
+
+        // Update: Strictly partitioned into Claim vs Revoke
+        allow update: if isValidId(emailHash) && (
+          // Action A: Atomic Claim by verified invited user (enforces not expired, existsAfter member doc)
+          (
+            isSignedIn() &&
+            request.auth.token.email_verified == true &&
+            resource.data.email == request.auth.token.email &&
+            resource.data.status == 'pending' &&
+            request.time < resource.data.expiresAt &&
+            request.resource.data.status == 'claimed' &&
+            request.resource.data.claimedBy == request.auth.uid &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'claimedBy', 'claimedAt']) &&
+            existsAfter(/databases/$(database)/documents/tenants/$(tenantId)/members/$(request.auth.uid))
+          ) ||
+          // Action B: Revocation by Tenant Owner (only pending invites, status only may change)
+          (
+            isTenantOwner(tenantId) &&
+            resource.data.status == 'pending' &&
+            request.resource.data.status == 'revoked' &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+          )
+        );
+
+        allow delete: if isTenantOwner(tenantId) || isAdmin();
+      }
+
+      // Tenant Members Subcollection
+      match /members/{memberUid} {
+        allow get, list: if isTenantMember(tenantId) || isAdmin();
+
+        // Create:
+        // Path A: Root Administrator can provision 'owner' or 'staff'.
+        // Path C: Verified Staff Member SELF-ENROLLS via Atomic Invite Claim (Direct enrollment Path B removed)
+        allow create: if isValidId(memberUid) && (
+          (isRootAdmin() && isValidMemberData(request.resource.data, memberUid)) ||
+          (
+            // === PATH C: SECURE ATOMIC INVITE CLAIM ===
+            request.auth.uid == memberUid &&
+            request.auth.token.email_verified == true &&
+            request.resource.data.role == 'staff' &&
+            request.resource.data.uid == memberUid &&
+            request.resource.data.email == request.auth.token.email &&
+            isTenantActive(tenantId) &&
+            'inviteHash' in request.resource.data &&
+            isValidId(request.resource.data.inviteHash) &&
+            // 1. Validate that the invitation exists and matches email/role/pending
+            exists(/databases/$(database)/documents/tenants/$(tenantId)/invites/$(request.resource.data.inviteHash)) &&
+            getStaffInvite(tenantId, request.resource.data.inviteHash).data.email == request.auth.token.email &&
+            getStaffInvite(tenantId, request.resource.data.inviteHash).data.role == 'staff' &&
+            getStaffInvite(tenantId, request.resource.data.inviteHash).data.status == 'pending' &&
+            // 2. Rule-enforced expiry check (server request time must be strictly before expiresAt)
+            request.time < getStaffInvite(tenantId, request.resource.data.inviteHash).data.expiresAt &&
+            // 3. ENFORCE ATOMIC STATE TRANSITION: Invite MUST transition to 'claimed' in the same transaction
+            getAfter(/databases/$(database)/documents/tenants/$(tenantId)/invites/$(request.resource.data.inviteHash)).data.status == 'claimed'
+          )
+        );
+
+        // 1. Root Administrator can update any member.
+        // 2. Tenant Owner can update staff members, but CANNOT promote to 'owner' or edit own record.
+        allow update: if isValidId(memberUid) && (
+          (isRootAdmin() && isValidMemberData(request.resource.data, memberUid)) ||
+          (
+            isTenantOwner(tenantId) &&
+            request.auth.uid != memberUid &&
+            resource.data.role == 'staff' &&
+            isValidStaffMemberData(request.resource.data, memberUid) &&
+            request.resource.data.uid == resource.data.uid
+          )
+        );
+
+        // 1. Root Administrator can delete any member.
+        // 2. Tenant Owner can remove staff members, but CANNOT delete owners or themselves.
+        allow delete: if isRootAdmin() || (
+          isTenantOwner(tenantId) &&
+          request.auth.uid != memberUid &&
+          resource.data.role == 'staff'
+        );
+      }
+
+      // Tenant Leads Subcollection
+      match /leads/{leadId} {
+        allow get, list: if isTenantMember(tenantId) || isAdmin();
+
+        // Delete restricted to Tenant Owners or Global Admins
+        allow delete: if isTenantOwner(tenantId) || isAdmin();
+
+        // Update restricted to verified members/admins with immutability enforcement
+        allow update: if isValidId(leadId) &&
+          (isTenantMember(tenantId) || isAdmin()) &&
+          isValidCrmLeadData(request.resource.data) &&
+          request.resource.data.id == resource.data.id &&
+          request.resource.data.clientId == resource.data.clientId &&
+          request.resource.data.timestamp == resource.data.timestamp;
+
+        // Create:
+        // Path A: Anonymous public form submitter (strict allowlist, NO notes/CRM fields, status 'New', target active & exists, no overwrites)
+        // Path B: Authenticated CRM member/admin (can create leads manually with valid CRM data)
+        allow create: if isValidId(leadId) &&
+          exists(/databases/$(database)/documents/tenants/$(tenantId)) &&
+          (isAdmin() || isTenantActive(tenantId)) &&
+          !exists(/databases/$(database)/documents/tenants/$(tenantId)/leads/$(leadId)) &&
+          request.resource.data.id == leadId &&
+          request.resource.data.clientId == tenantId &&
+          (
+            isValidPublicLeadSubmission(request.resource.data) ||
+            ((isTenantMember(tenantId) || isAdmin()) && isValidCrmLeadData(request.resource.data))
+          );
+      }
+    }
+
+    // ==========================================
+    // Public Slug Resolution Collection: /slugs/{slug}
+    // ==========================================
+    match /slugs/{slug} {
+      // Helper: verify target tenant is active
+      function isSlugTenantActive(tId) {
+        return exists(/databases/$(database)/documents/tenants/$(tId)) &&
+          ('status' in get(/databases/$(database)/documents/tenants/$(tId)).data) &&
+          get(/databases/$(database)/documents/tenants/$(tId)).data.status == 'active';
+      }
+
+      // Helper: verify target tenant website is published
+      function isSlugTenantWebsitePublished(tId) {
+        return exists(/databases/$(database)/documents/tenants/$(tId)/public/website) &&
+          get(/databases/$(database)/documents/tenants/$(tId)/public/website).data.isPublished == true;
+      }
+
+     
+      // Public users may GET a slug mapping only when its tenant exists,
+      // is active, and has a published public website.
+      // A missing slug is allowed to return a non-existent document.
+      allow get: if isValidId(slug) && (
+        isRootAdmin() ||
+        !exists(/databases/$(database)/documents/slugs/$(slug)) ||
+        (
+          'tenantId' in resource.data &&
+          isValidId(resource.data.tenantId) &&
+          isSlugTenantActive(resource.data.tenantId) &&
+          isSlugTenantWebsitePublished(resource.data.tenantId)
+        )
+      );
+
+
+      // Public users must not LIST slug mappings
+      allow list: if isRootAdmin();
+
+      // Only Root Admin may create, update, or delete mappings
+      allow create: if isRootAdmin() &&
+        isValidId(slug) &&
+        !isReservedSlug(slug) &&
+        request.resource.data.keys().hasAll(['slug', 'tenantId', 'createdAt']) &&
+        request.resource.data.keys().hasOnly(['slug', 'tenantId', 'createdAt', 'updatedAt']) &&
+        request.resource.data.slug == slug &&
+        request.resource.data.tenantId is string &&
+        isValidId(request.resource.data.tenantId) &&
+        exists(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)) &&
+        !exists(/databases/$(database)/documents/slugs/$(slug));
+
+      allow update: if isRootAdmin() &&
+        isValidId(slug) &&
+        request.resource.data.keys().hasAll(['slug', 'tenantId']) &&
+        request.resource.data.keys().hasOnly(['slug', 'tenantId', 'createdAt', 'updatedAt']) &&
+        request.resource.data.slug == resource.data.slug &&
+        request.resource.data.tenantId is string &&
+        isValidId(request.resource.data.tenantId) &&
+        exists(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId));
+
+      allow delete: if isRootAdmin();
+    }
+  }
+}
