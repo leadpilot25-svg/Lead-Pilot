@@ -13,8 +13,16 @@ import {
   X,
   CheckCircle2,
   Settings,
+  Link2,
 } from 'lucide-react';
-import { listTenantRecords, createTenantRecord } from '../auth/clientAuth';
+import {
+  listTenantRecords,
+  createTenantRecord,
+  updateTenantSlugAtomic,
+  validateAndNormalizeSlug,
+  verifyRootAdminStatus,
+} from '../auth/clientAuth';
+import { auth } from '../firebase';
 import { TenantRecord } from '../types';
 import { INDUSTRY_PRESETS } from '../presets/industryPresets';
 import { SuperAdminWebsiteEditor } from './SuperAdminWebsiteEditor';
@@ -22,6 +30,7 @@ import { SuperAdminWebsiteEditor } from './SuperAdminWebsiteEditor';
 interface SuperAdminClientDirectoryProps {
   onSelectTenantScope?: (tenantId: string) => void;
   activeSelectedTenant?: string;
+  isRootAdmin?: boolean;
 }
 
 // Generate a valid slug for tenant IDs: lower-case alphanumeric, hyphens, and underscores only
@@ -39,7 +48,10 @@ function generateTenantSlug(name: string): string {
 export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps> = ({
   onSelectTenantScope,
   activeSelectedTenant,
+  isRootAdmin = false,
 }) => {
+  const [verifiedRootAdmin, setVerifiedRootAdmin] = useState<boolean>(false);
+  const [isCheckingAccess, setIsCheckingAccess] = useState<boolean>(true);
   const [tenants, setTenants] = useState<TenantRecord[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -53,11 +65,19 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
   const [isAddModalOpen, setIsAddModalOpen] = useState<boolean>(false);
   const [formBusinessName, setFormBusinessName] = useState<string>('');
   const [formTenantId, setFormTenantId] = useState<string>('');
+  const [formSlug, setFormSlug] = useState<string>('');
   const [isTenantIdTouched, setIsTenantIdTouched] = useState<boolean>(false);
+  const [isSlugTouched, setIsSlugTouched] = useState<boolean>(false);
   const [formIndustry, setFormIndustry] = useState<string>('general-business');
   const [formOwnerEmail, setFormOwnerEmail] = useState<string>('');
   const [modalError, setModalError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+
+  // Slug Editor Modal State (for existing tenants)
+  const [slugModalTenant, setSlugModalTenant] = useState<TenantRecord | null>(null);
+  const [slugInputValue, setSlugInputValue] = useState<string>('');
+  const [slugModalError, setSlugModalError] = useState<string | null>(null);
+  const [isSavingSlug, setIsSavingSlug] = useState<boolean>(false);
 
   // Available industry preset keys with human-readable labels
   const availableIndustries = Object.keys(INDUSTRY_PRESETS).map((key) => ({
@@ -65,41 +85,110 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
     label: INDUSTRY_PRESETS[key]?.industry || key.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
   }));
 
-  const fetchTenants = async () => {
+  const fetchTenants = async (): Promise<TenantRecord[]> => {
     setIsLoading(true);
     setErrorMessage(null);
     try {
       const records = await listTenantRecords();
       setTenants(records);
+      return records;
     } catch (err: any) {
       setErrorMessage(
-        err?.message || 'Failed to retrieve tenant directory. Firestore administrator access is required.'
+        err?.message || 'Failed to retrieve tenant directory. Root Administrator access is required.'
       );
+      return [];
     } finally {
       setIsLoading(false);
     }
   };
 
   useEffect(() => {
-    fetchTenants();
-  }, []);
+    let isMounted = true;
+    async function verifyAndLoad() {
+      setIsCheckingAccess(true);
+      const rootOk = isRootAdmin && (await verifyRootAdminStatus(auth.currentUser));
+      if (!isMounted) return;
+      setVerifiedRootAdmin(rootOk);
+      setIsCheckingAccess(false);
+      if (rootOk) {
+        await fetchTenants();
+      } else {
+        setIsLoading(false);
+      }
+    }
+    verifyAndLoad();
+    return () => {
+      isMounted = false;
+    };
+  }, [isRootAdmin]);
 
   // Sync slug if the user hasn't manually customized the tenant ID
   const handleBusinessNameChange = (val: string) => {
     setFormBusinessName(val);
+    const derived = generateTenantSlug(val);
     if (!isTenantIdTouched) {
-      setFormTenantId(generateTenantSlug(val));
+      setFormTenantId(derived);
+    }
+    if (!isSlugTouched) {
+      setFormSlug(derived.replace(/_/g, '-'));
     }
   };
 
   const handleOpenAddModal = () => {
     setFormBusinessName('');
     setFormTenantId('');
+    setFormSlug('');
     setIsTenantIdTouched(false);
+    setIsSlugTouched(false);
     setFormIndustry('general-business');
     setFormOwnerEmail('');
     setModalError(null);
     setIsAddModalOpen(true);
+  };
+
+  const handleOpenSlugModal = (tenant: TenantRecord) => {
+    setSlugModalTenant(tenant);
+    setSlugInputValue((tenant.slug || tenant.tenantId || '').replace(/_/g, '-'));
+    setSlugModalError(null);
+  };
+
+  const handleSaveSlugModal = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!slugModalTenant || isSavingSlug) return;
+    setSlugModalError(null);
+
+    const validation = validateAndNormalizeSlug(slugInputValue);
+    if (!validation.isValid) {
+      setSlugModalError(validation.error || 'Please enter a valid URL slug.');
+      return;
+    }
+
+    setIsSavingSlug(true);
+    try {
+      const rootOk = await verifyRootAdminStatus(auth.currentUser);
+      if (!rootOk) {
+        setSlugModalError('Action rejected: Only the verified Root Administrator may update public URL slugs.');
+        setIsSavingSlug(false);
+        return;
+      }
+
+      const res = await updateTenantSlugAtomic(slugModalTenant.tenantId, validation.normalizedSlug);
+      if (!res.success) {
+        setSlugModalError(res.error || 'Failed to save public URL slug.');
+        setIsSavingSlug(false);
+        return;
+      }
+
+      const savedTenantName = slugModalTenant.businessName;
+      setSlugModalTenant(null);
+      setSuccessBanner(`Public URL "/${validation.normalizedSlug}" enabled for "${savedTenantName}".`);
+      setTimeout(() => setSuccessBanner(null), 6000);
+      await fetchTenants();
+    } catch (err: any) {
+      setSlugModalError(err?.message || 'Unexpected error while saving public URL slug.');
+    } finally {
+      setIsSavingSlug(false);
+    }
   };
 
   const handleCloseAddModal = () => {
@@ -114,6 +203,7 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
 
     const cleanName = formBusinessName.trim();
     const cleanTenantId = formTenantId.trim().toLowerCase();
+    const cleanSlug = formSlug.trim().toLowerCase();
     const cleanEmail = formOwnerEmail.trim().toLowerCase();
 
     // 1. Validate Business Name
@@ -133,7 +223,18 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
       return;
     }
 
-    // 3. Validate Owner Email format if provided
+    // 3. Validate Public URL Slug if provided
+    let normalizedSlug = '';
+    if (cleanSlug) {
+      const slugCheck = validateAndNormalizeSlug(cleanSlug);
+      if (!slugCheck.isValid) {
+        setModalError(slugCheck.error || 'Invalid Public URL Slug.');
+        return;
+      }
+      normalizedSlug = slugCheck.normalizedSlug;
+    }
+
+    // 4. Validate Owner Email format if provided
     if (cleanEmail) {
       const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
       if (!emailRegex.test(cleanEmail)) {
@@ -144,7 +245,14 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
 
     setIsSubmitting(true);
     try {
-      // 4. Atomic createTenantRecord handles duplicate prevention via Firestore runTransaction
+      const rootOk = await verifyRootAdminStatus(auth.currentUser);
+      if (!rootOk) {
+        setModalError('Action rejected: Only the verified Root Administrator may create business client tenants.');
+        setIsSubmitting(false);
+        return;
+      }
+
+      // 5. Atomic createTenantRecord handles duplicate prevention & slug reservation via Firestore runTransaction
       const result = await createTenantRecord({
         tenantId: cleanTenantId,
         businessName: cleanName,
@@ -152,6 +260,7 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
         status: 'active',
         isPublished: false,
         ownerEmail: cleanEmail,
+        ...(normalizedSlug ? { slug: normalizedSlug } : {}),
       });
 
       if (!result.success) {
@@ -162,7 +271,11 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
 
       // Success
       setIsAddModalOpen(false);
-      setSuccessBanner(`Client tenant "${cleanName}" (${cleanTenantId}) created successfully.`);
+      setSuccessBanner(
+        normalizedSlug
+          ? `Client tenant "${cleanName}" (${cleanTenantId}) created with public URL "/${normalizedSlug}".`
+          : `Client tenant "${cleanName}" (${cleanTenantId}) created successfully.`
+      );
       setTimeout(() => setSuccessBanner(null), 6000);
 
       // Refresh directory
@@ -185,10 +298,34 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
     return (
       t.businessName.toLowerCase().includes(q) ||
       t.tenantId.toLowerCase().includes(q) ||
+      (t.slug && t.slug.toLowerCase().includes(q)) ||
       (t.industry && t.industry.toLowerCase().includes(q)) ||
       (t.ownerEmail && t.ownerEmail.toLowerCase().includes(q))
     );
   });
+
+  if (isCheckingAccess) {
+    return (
+      <div className="max-w-7xl mx-auto px-4 py-12 text-center text-slate-400 text-xs">
+        <RefreshCw className="w-6 h-6 text-amber-400 animate-spin mx-auto mb-2" />
+        Verifying Root Administrator permissions...
+      </div>
+    );
+  }
+
+  if (!verifiedRootAdmin) {
+    return (
+      <div className="max-w-xl mx-auto px-4 py-12">
+        <div className="bg-slate-900 border border-rose-500/30 rounded-2xl p-6 text-center shadow-xl">
+          <AlertCircle className="w-8 h-8 text-rose-400 mx-auto mb-3" />
+          <h2 className="text-base font-extrabold text-white">Root Administrator Access Required</h2>
+          <p className="text-xs text-slate-400 mt-1.5">
+            Client directory access, tenant creation, and public URL slug management are restricted exclusively to the verified Root Administrator.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-8">
@@ -346,7 +483,7 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                 <thead>
                   <tr className="bg-slate-950/60 border-b border-slate-800 text-[11px] font-extrabold uppercase tracking-wider text-slate-400">
                     <th className="px-5 py-3.5">Business Name</th>
-                    <th className="px-5 py-3.5">Tenant ID</th>
+                    <th className="px-5 py-3.5">Tenant ID & Public URL</th>
                     <th className="px-5 py-3.5">Industry</th>
                     <th className="px-5 py-3.5">Owner Email</th>
                     <th className="px-5 py-3.5">Account Status</th>
@@ -384,11 +521,38 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                           </div>
                         </td>
 
-                        {/* Tenant ID */}
+                        {/* Tenant ID & Public URL Slug */}
                         <td className="px-5 py-4">
-                          <span className="font-mono text-xs text-emerald-400 bg-emerald-950/40 border border-emerald-500/30 px-2 py-0.5 rounded">
-                            {tenant.tenantId}
-                          </span>
+                          <div className="flex flex-col items-start gap-1.5">
+                            <span className="font-mono text-xs text-emerald-400 bg-emerald-950/40 border border-emerald-500/30 px-2 py-0.5 rounded">
+                              {tenant.tenantId}
+                            </span>
+                            {tenant.slug ? (
+                              <div className="flex items-center gap-1.5">
+                                <span className="font-mono text-[11px] text-sky-300 bg-sky-950/40 border border-sky-500/30 px-2 py-0.5 rounded">
+                                  /{tenant.slug}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenSlugModal(tenant)}
+                                  className="text-[10px] font-bold text-slate-400 hover:text-white underline cursor-pointer"
+                                  title="Change Public URL Slug"
+                                >
+                                  Edit URL
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => handleOpenSlugModal(tenant)}
+                                className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-300 hover:text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 px-2 py-0.5 rounded transition cursor-pointer"
+                                title="Create /slugs/{slug} mapping so public visitors can open this portal"
+                              >
+                                <Link2 className="w-3 h-3" />
+                                <span>Set Public URL</span>
+                              </button>
+                            )}
+                          </div>
                         </td>
 
                         {/* Industry */}
@@ -546,6 +710,16 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                   </div>
 
                   <div className="pt-2 flex flex-col gap-2">
+                    {/* Public URL Slug Button */}
+                    <button
+                      type="button"
+                      onClick={() => handleOpenSlugModal(tenant)}
+                      className="w-full py-2 rounded-xl text-xs font-bold transition cursor-pointer flex items-center justify-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-sky-300 border border-slate-700"
+                    >
+                      <Link2 className="w-3.5 h-3.5 text-sky-400" />
+                      <span>{tenant.slug ? `Public URL: /${tenant.slug} (Edit)` : 'Set Public URL Slug'}</span>
+                    </button>
+
                     {/* Manage Website Button */}
                     <button
                       onClick={() => setEditingWebsiteTenant(tenant)}
@@ -581,11 +755,11 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
       {editingWebsiteTenant && (
         <SuperAdminWebsiteEditor
           tenant={editingWebsiteTenant}
+          isRootAdmin={verifiedRootAdmin}
           onClose={() => setEditingWebsiteTenant(null)}
           onSaved={async (savedTenantId) => {
-            await fetchTenants();
-            // Keep editing open or update tenant state in place
-            const updated = tenants.find((t) => t.tenantId === savedTenantId);
+            const refreshed = await fetchTenants();
+            const updated = refreshed.find((t) => t.tenantId === savedTenantId);
             if (updated) {
               setEditingWebsiteTenant(updated);
             }
@@ -659,14 +833,44 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                   placeholder="e.g. apex-dental-clinic"
                   value={formTenantId}
                   onChange={(e) => {
+                    const nextId = e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, '-');
                     setIsTenantIdTouched(true);
-                    setFormTenantId(e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, '-'));
+                    setFormTenantId(nextId);
+                    if (!isSlugTouched) {
+                      setFormSlug(nextId.replace(/_/g, '-'));
+                    }
                   }}
                   className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3.5 py-2.5 text-white font-mono placeholder-slate-500 focus:outline-none transition text-xs"
                   disabled={isSubmitting}
                 />
                 <p className="text-[11px] text-slate-500 mt-1">
                   Used in Firestore paths (/tenants/{formTenantId || 'tenantId'}) for strict database isolation.
+                </p>
+              </div>
+
+              {/* Public URL Slug */}
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-slate-300 font-bold">
+                    Public URL Slug <span className="text-slate-500 font-normal">(e.g. /{formSlug || 'apex-dental-clinic'})</span>
+                  </label>
+                  <span className="text-[10px] text-slate-500 font-mono">
+                    3–63 chars, a-z, 0-9, -
+                  </span>
+                </div>
+                <input
+                  type="text"
+                  placeholder="e.g. apex-dental-clinic"
+                  value={formSlug}
+                  onChange={(e) => {
+                    setIsSlugTouched(true);
+                    setFormSlug(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-'));
+                  }}
+                  className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3.5 py-2.5 text-white font-mono placeholder-slate-500 focus:outline-none transition text-xs"
+                  disabled={isSubmitting}
+                />
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Creates /slugs/{formSlug || 'slug'} atomically so visitors can open this business directly by URL path.
                 </p>
               </div>
 
@@ -736,6 +940,81 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                 >
                   {isSubmitting && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
                   <span>{isSubmitting ? 'Creating Client...' : 'Register Client'}</span>
+                </button>
+              </div>
+              </form>
+          </div>
+        </div>
+      )}
+
+      {/* Set / Edit Public URL Slug Modal */}
+      {slugModalTenant && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in">
+          <div className="relative w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 text-slate-100">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-800 mb-4">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-sky-500/10 border border-sky-500/30 text-sky-400">
+                  <Link2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-extrabold text-white">Public Website URL Slug</h3>
+                  <p className="text-xs text-slate-400">{slugModalTenant.businessName}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => !isSavingSlug && setSlugModalTenant(null)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {slugModalError && (
+              <div className="mb-4 p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <span>{slugModalError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleSaveSlugModal} className="space-y-4 text-xs">
+              <div>
+                <label className="block text-slate-300 font-bold mb-1">
+                  URL Path Slug
+                </label>
+                <div className="flex items-center bg-slate-950 border border-slate-700 focus-within:border-sky-500 rounded-xl overflow-hidden">
+                  <span className="px-3 py-2.5 text-slate-500 bg-slate-900 border-r border-slate-800 font-mono">/</span>
+                  <input
+                    type="text"
+                    required
+                    value={slugInputValue}
+                    onChange={(e) => setSlugInputValue(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-'))}
+                    placeholder="e.g. demo-tarot-kochi"
+                    className="w-full bg-transparent px-3 py-2.5 text-white font-mono placeholder-slate-500 focus:outline-none"
+                    disabled={isSavingSlug}
+                  />
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1.5">
+                  Maps <span className="font-mono text-sky-300">/slugs/{slugInputValue || 'slug'}</span> atomically to tenant <span className="font-mono text-emerald-400">{slugModalTenant.tenantId}</span>. If this tenant had an older slug, it will be safely retired.
+                </p>
+              </div>
+
+              <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setSlugModalTenant(null)}
+                  disabled={isSavingSlug}
+                  className="px-4 py-2 rounded-xl text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 font-bold text-xs transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingSlug}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white font-bold text-xs transition shadow-md cursor-pointer"
+                >
+                  {isSavingSlug && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                  <span>{isSavingSlug ? 'Saving URL...' : 'Save Public URL'}</span>
                 </button>
               </div>
             </form>

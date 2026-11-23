@@ -379,6 +379,27 @@ async function runSheetSyncTestSuite() {
     // TEST 9: Preserving existing landing-page enquiry submission
     // -------------------------------------------------------------
     // Verify saveLead continues to save enquiries for roofing-client-01
+    // using an isolated in-memory mocked Firestore database (never writes to live Firestore)
+    const mockFirestoreTenants = new Map<string, { status: string }>([
+      [ROOFING_TENANT, { status: 'active' }],
+    ]);
+    const mockFirestoreLeads = new Map<string, Record<string, any>>();
+    const allowedPublicLeadFields = new Set([
+      'id',
+      'timestamp',
+      'clientId',
+      'businessName',
+      'name',
+      'phone',
+      'email',
+      'service',
+      'details',
+      'address',
+      'leadSource',
+      'pageUrl',
+      'status',
+    ]);
+
     global.fetch = async () => {
       return {
         ok: true,
@@ -398,7 +419,26 @@ async function runSheetSyncTestSuite() {
         service: 'Emergency Roof Tarping',
         details: 'Tree branch fell on roof.',
       },
-      'https://mock-script.test/exec'
+      'https://mock-script.test/exec',
+      {
+        persistLeadToFirestore: async ({ tenantId, leadId, payload }) => {
+          const tenantDoc = mockFirestoreTenants.get(tenantId);
+          if (!tenantDoc || tenantDoc.status !== 'active') {
+            throw new Error('7 PERMISSION_DENIED: Tenant does not exist or is inactive.');
+          }
+          const hasUnauthorizedFields = Object.keys(payload).some(
+            (key) => !allowedPublicLeadFields.has(key)
+          );
+          if (hasUnauthorizedFields || payload.status !== 'New') {
+            throw new Error('7 PERMISSION_DENIED: Invalid public lead fields.');
+          }
+          mockFirestoreLeads.set(`tenants/${tenantId}/leads/${leadId}`, payload);
+        },
+      }
+    );
+
+    const savedMockDoc = mockFirestoreLeads.get(
+      `tenants/${ROOFING_TENANT}/leads/${saveRes.lead?.id}`
     );
 
     assert(
@@ -407,8 +447,10 @@ async function runSheetSyncTestSuite() {
       saveRes.success === true &&
         saveRes.lead.name === 'Sarah Connor' &&
         saveRes.lead.clientId === ROOFING_TENANT &&
-        saveRes.lead.status === 'New',
-      `Landing page saveLead succeeded: "${saveRes.lead.name}" (${saveRes.lead.id}) with status 'New'`
+        saveRes.lead.status === 'New' &&
+        Boolean(savedMockDoc) &&
+        savedMockDoc?.status === 'New',
+      `Landing page saveLead succeeded via mocked Firestore: "${saveRes.lead.name}" (${saveRes.lead.id}) with status 'New'`
     );
 
     // -------------------------------------------------------------

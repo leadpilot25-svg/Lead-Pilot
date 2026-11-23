@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { ClientConfig } from '../types';
+import { ClientConfig, TenantRecord } from '../types';
 import {
   getCurrentClientSession,
   loginClient,
@@ -7,8 +7,11 @@ import {
   logoutClient,
   ClientUser,
   onClientAuthStateChanged,
-  verifyServerAdminStatus,
+  verifyServerAdminCapabilities,
   claimStaffInviteAtomic,
+  fetchPublicWebsiteConfig,
+  fetchTenantWebsiteDraft,
+  listTenantRecords,
 } from '../auth/clientAuth';
 import { auth } from '../firebase';
 import { LeadPilotDashboard } from './LeadPilotDashboard';
@@ -19,6 +22,7 @@ import { CLIENT_PRESETS, DEMO_CLIENT_CONFIG } from '../presets/clientPresets';
 import { INDUSTRY_PRESETS } from '../presets/industryPresets';
 import { migrateLocalStorageToFirestore } from '../utils/leadStorage';
 import { IS_DEV_DEPLOYMENT } from '../config/appTarget';
+import { resolveTenantFormEndpoint } from '../config/clientConfigResolver';
 
 interface StandaloneCrmProps {
   defaultClientId?: string;
@@ -33,9 +37,16 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [migrationStatus, setMigrationStatus] = useState<string | null>(null);
   const [isVerifiedAdmin, setIsVerifiedAdmin] = useState(false);
+  const [isRootAdmin, setIsRootAdmin] = useState(false);
+  const [isAuthResolving, setIsAuthResolving] = useState<boolean>(() => !getCurrentClientSession());
   const [adminSelectedTenant, setAdminSelectedTenant] = useState<string>('');
   const [adminViewMode, setAdminViewMode] = useState<'crm' | 'directory'>('crm');
   const [clientViewMode, setClientViewMode] = useState<'crm' | 'team'>('crm');
+  const [firestoreWebsiteConfig, setFirestoreWebsiteConfig] = useState<{
+    tenantId: string;
+    config: Partial<ClientConfig>;
+  } | null>(null);
+  const [adminTenantList, setAdminTenantList] = useState<TenantRecord[]>([]);
 
   // URL Invitation parameters
   const [pendingInvite, setPendingInvite] = useState<{ tenantId: string; hash: string } | null>(() => {
@@ -51,22 +62,39 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
   });
   const [claimStatus, setClaimStatus] = useState<{ type: 'loading' | 'success' | 'error'; message: string } | null>(null);
 
-  // Sync auth state with Firebase Auth and verify server admin status
+  // Sync auth state with Firebase Auth and resolve admin capabilities before setting user
   useEffect(() => {
+    let isMounted = true;
     const unsubscribe = onClientAuthStateChanged(async (user) => {
-      setCurrentUser(user);
       if (user && auth.currentUser) {
-        const isAdmin = await verifyServerAdminStatus(auth.currentUser);
-        setIsVerifiedAdmin(isAdmin);
-        if (isAdmin) {
+        const caps = await verifyServerAdminCapabilities(auth.currentUser);
+        if (!isMounted) return;
+        setIsVerifiedAdmin(caps.isAdmin);
+        setIsRootAdmin(caps.isRootAdmin);
+        if (caps.isAdmin) {
           setAdminSelectedTenant((prev) => prev || user.clientId || defaultClientId);
+        } else {
+          setAdminSelectedTenant('');
         }
+        if (!caps.isRootAdmin) {
+          setAdminViewMode('crm');
+        }
+        setCurrentUser(user);
+        setIsAuthResolving(false);
       } else {
+        if (!isMounted) return;
         setIsVerifiedAdmin(false);
+        setIsRootAdmin(false);
+        setAdminViewMode('crm');
         setAdminSelectedTenant('');
+        setCurrentUser(null);
+        setIsAuthResolving(false);
       }
     });
-    return () => unsubscribe();
+    return () => {
+      isMounted = false;
+      unsubscribe();
+    };
   }, [defaultClientId]);
 
   // Safe migration of existing local records when authenticated
@@ -146,7 +174,19 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
     try {
       const res = await loginClient(loginEmail, loginPassword);
       if (res.success && res.user) {
+        const caps = await verifyServerAdminCapabilities(auth.currentUser);
+        setIsVerifiedAdmin(caps.isAdmin);
+        setIsRootAdmin(caps.isRootAdmin);
+        if (caps.isAdmin) {
+          setAdminSelectedTenant((prev) => prev || res.user!.clientId || defaultClientId);
+        } else {
+          setAdminSelectedTenant('');
+        }
+        if (!caps.isRootAdmin) {
+          setAdminViewMode('crm');
+        }
         setCurrentUser(res.user);
+        setIsAuthResolving(false);
         setLoginEmail('');
         setLoginPassword('');
       } else {
@@ -165,7 +205,19 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
     try {
       const res = await loginWithGoogle();
       if (res.success && res.user) {
+        const caps = await verifyServerAdminCapabilities(auth.currentUser);
+        setIsVerifiedAdmin(caps.isAdmin);
+        setIsRootAdmin(caps.isRootAdmin);
+        if (caps.isAdmin) {
+          setAdminSelectedTenant((prev) => prev || res.user!.clientId || defaultClientId);
+        } else {
+          setAdminSelectedTenant('');
+        }
+        if (!caps.isRootAdmin) {
+          setAdminViewMode('crm');
+        }
         setCurrentUser(res.user);
+        setIsAuthResolving(false);
       } else {
         setLoginError(res.error || 'Google Sign-In was cancelled or failed.');
       }
@@ -178,36 +230,134 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
 
   const handleLogout = async () => {
     await logoutClient();
+    setIsVerifiedAdmin(false);
+    setIsRootAdmin(false);
+    setAdminViewMode('crm');
+    setAdminSelectedTenant('');
     setCurrentUser(null);
+    setIsAuthResolving(false);
   };
 
-  // If the user is a server-verified administrator, allow switching tenants via adminSelectedTenant.
-  // Regular client users are strictly locked into their own tenant: currentUser.clientId
-  const activeClientId = isVerifiedAdmin && adminSelectedTenant
+  // Only Root Admin can switch tenants via selector; provisioned admins and regular users stay scoped
+  const activeClientId = (isRootAdmin || isVerifiedAdmin) && adminSelectedTenant
     ? adminSelectedTenant
     : (currentUser?.clientId || (IS_DEV_DEPLOYMENT ? defaultClientId : ''));
 
+  // Load Firestore website configuration for the active tenant (picks up saved CONFIG.formEndpoint & branding)
+  useEffect(() => {
+    const cleanId = (activeClientId || '').trim().toLowerCase();
+    if (!currentUser || !cleanId) {
+      setFirestoreWebsiteConfig(null);
+      return;
+    }
+
+    let isCancelled = false;
+    async function loadTenantConfig() {
+      try {
+        if (isVerifiedAdmin) {
+          const draftRes = await fetchTenantWebsiteDraft(cleanId);
+          if (!isCancelled && draftRes.success && draftRes.config) {
+            setFirestoreWebsiteConfig({ tenantId: cleanId, config: draftRes.config });
+            return;
+          }
+        }
+        const pubRes = await fetchPublicWebsiteConfig(cleanId);
+        if (!isCancelled && pubRes.success && pubRes.config) {
+          setFirestoreWebsiteConfig({ tenantId: cleanId, config: pubRes.config });
+          return;
+        }
+        if (!isCancelled) {
+          setFirestoreWebsiteConfig(null);
+        }
+      } catch {
+        if (!isCancelled) {
+          setFirestoreWebsiteConfig(null);
+        }
+      }
+    }
+
+    loadTenantConfig();
+    return () => {
+      isCancelled = true;
+    };
+  }, [activeClientId, currentUser?.userId, isVerifiedAdmin, adminViewMode]);
+
+  // Load registered tenants strictly for Root Admin directory & selector
+  useEffect(() => {
+    if (!isRootAdmin || !currentUser) {
+      setAdminTenantList([]);
+      return;
+    }
+    let isCancelled = false;
+    listTenantRecords()
+      .then((records) => {
+        if (!isCancelled && Array.isArray(records)) {
+          setAdminTenantList(records);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      isCancelled = true;
+    };
+  }, [isRootAdmin, currentUser?.userId, adminViewMode]);
+
   const resolvedConfig: ClientConfig = React.useMemo(() => {
-    if (initialConfig && initialConfig.clientId === activeClientId) {
-      return initialConfig;
-    }
-    if (CLIENT_PRESETS[activeClientId]) {
-      return CLIENT_PRESETS[activeClientId];
-    }
+    const cleanId = (activeClientId || '').trim().toLowerCase();
     const rawKey = activeClientId.replace(/^client-/, '').replace(/^demo-/, '');
-    if (INDUSTRY_PRESETS[rawKey]) {
+    const presetConfig: ClientConfig = CLIENT_PRESETS[activeClientId]
+      ? CLIENT_PRESETS[activeClientId]
+      : INDUSTRY_PRESETS[rawKey]
+      ? {
+          ...INDUSTRY_PRESETS[rawKey],
+          clientId: activeClientId,
+          businessName: currentUser?.businessName || INDUSTRY_PRESETS[rawKey].businessName,
+        }
+      : {
+          ...DEMO_CLIENT_CONFIG,
+          clientId: activeClientId,
+          businessName: currentUser?.businessName || DEMO_CLIENT_CONFIG.businessName,
+        };
+
+    const baseline: ClientConfig =
+      initialConfig && initialConfig.clientId === activeClientId ? initialConfig : presetConfig;
+
+    // Strict tenant match guard before merging Firestore configuration
+    const matchedFirestore =
+      firestoreWebsiteConfig && firestoreWebsiteConfig.tenantId === cleanId
+        ? firestoreWebsiteConfig.config
+        : null;
+
+    const resolvedEndpoint = resolveTenantFormEndpoint({
+      tenantId: cleanId,
+      firestoreConfig: matchedFirestore,
+      initialConfig,
+      presetConfig,
+    });
+
+    if (matchedFirestore) {
       return {
-        ...INDUSTRY_PRESETS[rawKey],
+        ...baseline,
+        ...matchedFirestore,
         clientId: activeClientId,
-        businessName: currentUser?.businessName || INDUSTRY_PRESETS[rawKey].businessName,
+        formEndpoint: resolvedEndpoint,
       };
     }
+
     return {
-      ...DEMO_CLIENT_CONFIG,
-      clientId: activeClientId,
-      businessName: currentUser?.businessName || DEMO_CLIENT_CONFIG.businessName,
+      ...baseline,
+      formEndpoint: resolvedEndpoint || baseline.formEndpoint || '',
     };
-  }, [activeClientId, currentUser, initialConfig]);
+  }, [activeClientId, currentUser, initialConfig, firestoreWebsiteConfig]);
+
+  // Wait for initial Firebase Auth & Firestore profile/admin verification before rendering login or errors
+  if (isAuthResolving && !currentUser) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-300 flex flex-col justify-center items-center p-4">
+        <RefreshCw className="w-7 h-7 text-blue-400 animate-spin mb-3" />
+        <p className="text-sm font-medium">Verifying secure CRM session...</p>
+      </div>
+    );
+  }
 
   // Production Secure Login Portal
   if (!currentUser) {
@@ -372,8 +522,8 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
     );
   }
 
-  // If authenticated but no tenant membership is assigned, block access to leads
-  if (!currentUser.clientId) {
+  // If authenticated but no tenant membership is assigned (and not verified Root Admin), block access to leads
+  if (!currentUser.clientId && !isVerifiedAdmin) {
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center items-center p-4">
         <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 shadow-2xl text-center">
@@ -438,7 +588,7 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
 
           <div className="flex items-center gap-3">
             {/* Server-Verified Root Administrator Navigation Switch */}
-            {isVerifiedAdmin && (
+            {isRootAdmin && (
               <div className="flex items-center bg-slate-950/80 border border-slate-800 rounded-xl p-1 shadow-inner">
                 <button
                   onClick={() => setAdminViewMode('crm')}
@@ -497,8 +647,8 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
               </div>
             )}
 
-            {/* Server-Verified Platform Administrator Tenant Selector (in CRM view) */}
-            {isVerifiedAdmin && adminViewMode === 'crm' && (
+            {/* Root Administrator Tenant Selector (in CRM view) */}
+            {isRootAdmin && adminViewMode === 'crm' && (
               <div className="flex items-center gap-2 bg-slate-800/90 border border-amber-500/40 rounded-xl px-3 py-1.5 shadow-sm">
                 <span className="text-[11px] font-bold text-amber-400 uppercase tracking-wider hidden lg:flex items-center gap-1">
                   <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
@@ -509,12 +659,29 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
                   onChange={(e) => setAdminSelectedTenant(e.target.value)}
                   className="bg-slate-900 border border-slate-700 text-xs text-white rounded-lg px-2 py-1 focus:outline-none focus:border-amber-500 cursor-pointer"
                 >
-                  <option value="demo-tarot-kochi">Tarot Coaching & Guidance (demo-tarot-kochi)</option>
-                  <option value="roofing-client-01">Test Client (roofing-client-01)</option>
-                  <option value="client-apex-hvac">Apex Heating & Cooling (client-apex-hvac)</option>
-                  <option value="prodrain-plumbing-kochi">ProDrain Plumbing (prodrain-plumbing-kochi)</option>
-                  <option value="demo-plumbing">ProDrain Plumbing (demo-plumbing)</option>
-                  <option value="demo-skin-clinic">GlowAura Skin Clinic (demo-skin-clinic)</option>
+                  {adminTenantList.map((t) => (
+                    <option key={t.tenantId} value={t.tenantId}>
+                      {t.businessName} ({t.tenantId})
+                    </option>
+                  ))}
+                  {!adminTenantList.some((t) => t.tenantId === 'demo-tarot-kochi') && (
+                    <option value="demo-tarot-kochi">Tarot Coaching & Guidance (demo-tarot-kochi)</option>
+                  )}
+                  {!adminTenantList.some((t) => t.tenantId === 'roofing-client-01') && (
+                    <option value="roofing-client-01">Test Client (roofing-client-01)</option>
+                  )}
+                  {!adminTenantList.some((t) => t.tenantId === 'client-apex-hvac') && (
+                    <option value="client-apex-hvac">Apex Heating & Cooling (client-apex-hvac)</option>
+                  )}
+                  {!adminTenantList.some((t) => t.tenantId === 'prodrain-plumbing-kochi') && (
+                    <option value="prodrain-plumbing-kochi">ProDrain Plumbing (prodrain-plumbing-kochi)</option>
+                  )}
+                  {!adminTenantList.some((t) => t.tenantId === 'demo-plumbing') && (
+                    <option value="demo-plumbing">ProDrain Plumbing (demo-plumbing)</option>
+                  )}
+                  {!adminTenantList.some((t) => t.tenantId === 'demo-skin-clinic') && (
+                    <option value="demo-skin-clinic">GlowAura Skin Clinic (demo-skin-clinic)</option>
+                  )}
                 </select>
               </div>
             )}
@@ -523,7 +690,7 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
               <UserCheck className="w-3.5 h-3.5 text-emerald-400" />
               <span>{currentUser.email}</span>
               <span className="text-[10px] bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded uppercase font-bold">
-                {currentUser.role === 'client_staff' ? 'Staff' : 'Owner'}
+                {isRootAdmin ? 'Root Admin' : isVerifiedAdmin ? 'Admin' : currentUser.role === 'client_staff' ? 'Staff' : 'Owner'}
               </span>
             </div>
 
@@ -539,10 +706,11 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
         </div>
       </header>
 
-      {/* Main View: Super Admin Client Directory, Scoped Client Dashboard, or Tenant Staff Manager */}
+      {/* Main View: Root Admin Client Directory, Scoped Client Dashboard, or Tenant Staff Manager */}
       <main className="flex-1">
-        {isVerifiedAdmin && adminViewMode === 'directory' ? (
+        {isRootAdmin && adminViewMode === 'directory' ? (
           <SuperAdminClientDirectory
+            isRootAdmin={isRootAdmin}
             activeSelectedTenant={activeClientId}
             onSelectTenantScope={(tenantId) => {
               setAdminSelectedTenant(tenantId);

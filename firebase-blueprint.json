@@ -51,12 +51,73 @@
           "type": "string",
           "description": "Business industry category"
         },
+        "status": {
+          "type": "string",
+          "enum": ["active", "suspended"],
+          "description": "Tenant account activation status"
+        },
+        "isPublished": {
+          "type": "boolean",
+          "description": "Whether the tenant public landing website is published"
+        },
+        "slug": {
+          "type": "string",
+          "description": "Authoritative public URL slug mapped in /slugs/{slug}"
+        },
         "createdAt": {
           "type": "string",
           "description": "ISO timestamp of tenant creation"
         }
       },
       "required": ["id", "name"]
+    },
+    "SlugMapping": {
+      "title": "SlugMapping",
+      "description": "Authoritative public URL slug to Firestore tenantId mapping",
+      "type": "object",
+      "properties": {
+        "slug": {
+          "type": "string",
+          "description": "Lowercase hyphenated URL slug matching document ID"
+        },
+        "tenantId": {
+          "type": "string",
+          "description": "Target tenant document ID under /tenants/{tenantId}"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp of slug creation"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last slug update"
+        }
+      },
+      "required": ["slug", "tenantId", "createdAt"]
+    },
+    "TenantWebsite": {
+      "title": "TenantWebsite",
+      "description": "Published public website configuration for a tenant",
+      "type": "object",
+      "properties": {
+        "tenantId": {
+          "type": "string",
+          "description": "Owning tenant ID"
+        },
+        "businessName": {
+          "type": "string",
+          "description": "Public business display name"
+        },
+        "isPublished": {
+          "type": "boolean",
+          "description": "Publication visibility state"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of website publication or update"
+        }
+      },
+      "required": ["tenantId", "isPublished"]
     },
     "TenantMember": {
       "title": "TenantMember",
@@ -175,9 +236,17 @@
       "schema": "User",
       "description": "User profile with tenant affiliation and role"
     },
+    "/slugs/{slug}": {
+      "schema": "SlugMapping",
+      "description": "Authoritative public URL slug to tenant ID lookup"
+    },
     "/tenants/{tenantId}": {
       "schema": "Tenant",
       "description": "Tenant organization root"
+    },
+    "/tenants/{tenantId}/public/website": {
+      "schema": "TenantWebsite",
+      "description": "Publicly readable landing website config when tenant is active and website is published"
     },
     "/tenants/{tenantId}/members/{memberUid}": {
       "schema": "TenantMember",

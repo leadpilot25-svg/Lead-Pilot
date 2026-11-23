@@ -195,13 +195,15 @@ service cloud.firestore {
     match /tenants/{tenantId} {
       allow get: if isValidId(tenantId) && (isTenantMember(tenantId) || isAdmin());
       allow list: if isAdmin();
-      // Tenant creation: restricted strictly to platform administrators and cannot overwrite existing tenants
-      allow create: if isAdmin() && !exists(/databases/$(database)/documents/tenants/$(tenantId));
-      allow delete: if isAdmin();
-      // Tenant updates: Admin can update all fields; Tenant Owner can update non-status/non-published fields
-      allow update: if isAdmin() || (
-        isTenantOwner(tenantId) &&
-        (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['status', 'isPublished', 'id']))
+      // Tenant creation & deletion: restricted strictly to Root Admin and cannot overwrite existing tenants
+      allow create: if isRootAdmin() && isValidId(tenantId) && !exists(/databases/$(database)/documents/tenants/$(tenantId));
+      allow delete: if isRootAdmin();
+      // Tenant updates: Root Admin can update all fields; Provisioned Admins and Tenant Owners cannot modify protected identity, ownership, slug, status, or publish fields
+      allow update: if isRootAdmin() || (
+        (isAdmin() || isTenantOwner(tenantId)) &&
+        (!request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'status', 'isPublished', 'id', 'tenantId', 'slug', 'ownerEmail', 'createdAt'
+        ]))
       );
 
       // Dedicated Public Website Configuration Document: /tenants/{tenantId}/public/website
@@ -390,13 +392,11 @@ service cloud.firestore {
           get(/databases/$(database)/documents/tenants/$(tId)/public/website).data.isPublished == true;
       }
 
-     
-      // Public users may GET a slug mapping only when its tenant exists,
-      // is active, and has a published public website.
-      // A missing slug is allowed to return a non-existent document.
+      // Public users may GET a slug mapping only when its tenant exists, is active, and has a published public website.
+      // When the slug document does not exist (resource == null), allow clean exists == false without exposing data.
       allow get: if isValidId(slug) && (
         isRootAdmin() ||
-        !exists(/databases/$(database)/documents/slugs/$(slug)) ||
+        resource == null ||
         (
           'tenantId' in resource.data &&
           isValidId(resource.data.tenantId) &&
@@ -404,7 +404,6 @@ service cloud.firestore {
           isSlugTenantWebsitePublished(resource.data.tenantId)
         )
       );
-
 
       // Public users must not LIST slug mappings
       allow list: if isRootAdmin();
@@ -418,17 +417,18 @@ service cloud.firestore {
         request.resource.data.slug == slug &&
         request.resource.data.tenantId is string &&
         isValidId(request.resource.data.tenantId) &&
-        exists(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)) &&
+        existsAfter(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)) &&
         !exists(/databases/$(database)/documents/slugs/$(slug));
 
       allow update: if isRootAdmin() &&
         isValidId(slug) &&
+        !isReservedSlug(slug) &&
         request.resource.data.keys().hasAll(['slug', 'tenantId']) &&
         request.resource.data.keys().hasOnly(['slug', 'tenantId', 'createdAt', 'updatedAt']) &&
         request.resource.data.slug == resource.data.slug &&
         request.resource.data.tenantId is string &&
         isValidId(request.resource.data.tenantId) &&
-        exists(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId));
+        existsAfter(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId));
 
       allow delete: if isRootAdmin();
     }

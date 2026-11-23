@@ -214,8 +214,8 @@ export function resolveCurrentTenantId(hostname?: string, isProdOverride?: boole
   }
 
   // 2. Explicit Dedicated Single-Tenant Build Mode (e.g. standalone Vercel client deployment)
-  // Only permitted if explicitly marked with VITE_SINGLE_TENANT_MODE=true AND not on a shared domain
-  if (isDedicatedSingleTenant && !currentHost.includes('leadpilot.pages.dev')) {
+  // Only permitted if explicitly marked with VITE_SINGLE_TENANT_MODE=true AND not on a shared .pages.dev domain
+  if (isDedicatedSingleTenant && !currentHost.endsWith('.pages.dev')) {
     const envId = (
       (import.meta as any).env?.VITE_CLIENT_ID ||
       (typeof process !== 'undefined' ? process.env?.VITE_CLIENT_ID : '')
@@ -239,7 +239,7 @@ export function resolveCurrentTenantId(hostname?: string, isProdOverride?: boole
       (import.meta as any).env?.VITE_CLIENT_ID ||
       (typeof process !== 'undefined' ? process.env?.VITE_CLIENT_ID : '')
     )?.toString().trim().toLowerCase();
-    if (devEnvId && !currentHost.includes('leadpilot.pages.dev')) {
+    if (devEnvId && !currentHost.endsWith('.pages.dev')) {
       return { tenantId: devEnvId, isValid: true };
     }
     return { tenantId: 'demo-tarot-kochi', isValid: true };

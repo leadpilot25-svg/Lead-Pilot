@@ -17,6 +17,7 @@ import {
   subscribeTenantLeads,
   deleteLead,
   syncGoogleSheetToCrm,
+  isCloudflareGatewayMode,
   SheetSyncSummary,
 } from '../utils/leadStorage';
 import {
@@ -323,7 +324,7 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
 
   // Practical Automatic Synchronization (Periodic Polling while CRM is open)
   useEffect(() => {
-    if (!autoSyncEnabled || !endpoint || !endpoint.startsWith('http')) return;
+    if (!autoSyncEnabled || (!isCloudflareGatewayMode() && (!endpoint || !endpoint.startsWith('http')))) return;
 
     const interval = setInterval(() => {
       handleSyncRemoteLeads(true);
@@ -350,6 +351,8 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
     if (endpoint && endpoint.startsWith('http')) {
       runConnectionTest();
       handleSyncRemoteLeads();
+    } else if (isCloudflareGatewayMode()) {
+      handleSyncRemoteLeads(true);
     } else {
       setConnStatus('unconfigured');
       setConnMsg('Google Apps Script URL is missing or unconfigured in CONFIG.formEndpoint.');
@@ -538,7 +541,7 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
     setSyncingAction(true);
     setActionNotification(null);
     try {
-      const res = await logLeadContact(lead.id, 'Call', undefined, endpoint);
+      const res = await logLeadContact(lead.id, 'Call', undefined, lead.clientId || activeTenantScope, endpoint);
       if (res.success) {
         refreshLocalLeads();
         setActionNotification({ type: 'success', message: `Call initiated (+${raw}) & logged ✓` });
@@ -1157,10 +1160,16 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
                 </h3>
                 <div className="space-y-2 text-xs">
                   <div>
-                    <span className="text-slate-500 block text-[10px] uppercase font-bold">Backend Sync</span>
-                    <span className="text-emerald-400 font-bold flex items-center gap-1">
-                      <Check className="w-3.5 h-3.5 text-emerald-400" /> Active 2-Way Synchronization
-                    </span>
+                    <span className="text-slate-500 block text-[10px] uppercase font-bold">Google Sheet Webhook (CONFIG.formEndpoint)</span>
+                    {endpoint ? (
+                      <span className="text-emerald-400 font-bold flex items-center gap-1">
+                        <Check className="w-3.5 h-3.5 text-emerald-400" /> Configured
+                      </span>
+                    ) : (
+                      <span className="text-amber-400 font-bold flex items-center gap-1">
+                        <AlertTriangle className="w-3.5 h-3.5 text-amber-400" /> Not Configured in Website Settings
+                      </span>
+                    )}
                   </div>
                   <div>
                     <span className="text-slate-500 block text-[10px] uppercase font-bold">Client Isolation Scope</span>

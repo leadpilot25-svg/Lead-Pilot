@@ -86,12 +86,14 @@ describe('Phase 1: Multi-Tenant Data Layer & Security Rules Suite (Static & Simu
       expect(draftBlock).not.toContain('isTenantMember');
     });
 
-    it('6. Duplicate Tenant Creation Gate: Rules enforce !exists on tenant creation', () => {
-      expect(rulesContent).toContain('allow create: if isAdmin() && !exists(/databases/$(database)/documents/tenants/$(tenantId));');
+    it('6. Duplicate Tenant Creation Gate: Rules restrict creation to Root Admin and enforce !exists', () => {
+      expect(rulesContent).toContain('allow create: if isRootAdmin() && isValidId(tenantId) && !exists(/databases/$(database)/documents/tenants/$(tenantId));');
     });
 
-    it('7. Tenant document updates: Tenant owners CANNOT modify status, isPublished, or id', () => {
-      expect(rulesContent).toContain("!request.resource.data.diff(resource.data).affectedKeys().hasAny(['status', 'isPublished', 'id'])");
+    it('7. Tenant document updates: Non-Root Admins and Tenant Owners CANNOT modify status, publish state, identity, slug, or ownership fields', () => {
+      const tenantUpdateBlock = rulesContent.match(/allow update: if isRootAdmin\(\) \|\| \([\s\S]*?\);/)?.[0] || '';
+      expect(tenantUpdateBlock).not.toBe('');
+      expect(tenantUpdateBlock).toContain("'status', 'isPublished', 'id', 'tenantId', 'slug', 'ownerEmail', 'createdAt'");
     });
 
     it('8. Public lead creation requires target tenant to be active', () => {

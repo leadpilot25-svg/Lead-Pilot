@@ -82,3 +82,89 @@ export function getClientConfigForEnvClientId(
   // 3. Strict rejection: Unknown client IDs MUST NOT fall back to Tarot
   return { key: cleanId, config: null, isValid: false };
 }
+
+/**
+ * Resolve per-tenant build-time Vite endpoint variable without leaking another tenant's URL.
+ */
+export function getEnvFormEndpointForTenant(
+  tenantId: string,
+  envOverride?: Record<string, any>
+): string {
+  const cleanId = (tenantId || '').trim().toLowerCase();
+  if (!cleanId) return '';
+
+  const env = envOverride || ((import.meta as any).env as Record<string, any>) || {};
+  const normalizedSuffix = cleanId.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+
+  // 1. Explicit per-tenant env var: VITE_FORM_ENDPOINT_<TENANT_ID_UPPER_SNAKE>
+  const explicitPerTenant = env[`VITE_FORM_ENDPOINT_${normalizedSuffix}`];
+  if (typeof explicitPerTenant === 'string' && explicitPerTenant.trim().startsWith('http')) {
+    return explicitPerTenant.trim();
+  }
+
+  // 2. Named preset env vars strictly mapped to their respective tenant IDs
+  if (cleanId === 'demo-tarot-kochi' || cleanId === 'demo-tarot') {
+    const val = env.VITE_FORM_ENDPOINT_TAROT || env.VITE_FORM_ENDPOINT || '';
+    return typeof val === 'string' && val.trim().startsWith('http') ? val.trim() : '';
+  }
+  if (cleanId === 'client-apex-hvac' || cleanId === 'demo-hvac') {
+    const val = env.VITE_FORM_ENDPOINT_APEX || '';
+    return typeof val === 'string' && val.trim().startsWith('http') ? val.trim() : '';
+  }
+  if (cleanId === 'roofing-client-01' || cleanId === 'demo-roofing') {
+    const val = env.VITE_FORM_ENDPOINT_ROOFING || env.VITE_FORM_ENDPOINT || '';
+    return typeof val === 'string' && val.trim().startsWith('http') ? val.trim() : '';
+  }
+  if (cleanId === 'prodrain-plumbing-kochi' || cleanId === 'demo-plumbing') {
+    const val = env.VITE_FORM_ENDPOINT_PRODRAIN || env.VITE_FORM_ENDPOINT || '';
+    return typeof val === 'string' && val.trim().startsWith('http') ? val.trim() : '';
+  }
+
+  return '';
+}
+
+/**
+ * Resolve CONFIG.formEndpoint for a specific tenant strictly inside its tenant boundary.
+ * Priority:
+ * 1. Saved Firestore website configuration (when matching tenantId)
+ * 2. Initial runtime config (when matching tenantId)
+ * 3. Preset config (when matching tenantId)
+ * 4. Tenant-scoped build-time environment variable (VITE_FORM_ENDPOINT_<TENANT> / VITE_FORM_ENDPOINT_TAROT)
+ */
+export function resolveTenantFormEndpoint(options: {
+  tenantId: string;
+  firestoreConfig?: Partial<ClientConfig> | null;
+  initialConfig?: Partial<ClientConfig> | null;
+  presetConfig?: Partial<ClientConfig> | null;
+  env?: Record<string, any>;
+}): string {
+  const cleanId = (options.tenantId || '').trim().toLowerCase();
+  if (!cleanId) return '';
+
+  const fsCfg = options.firestoreConfig;
+  if (fsCfg) {
+    const fsTenant = (fsCfg.clientId || cleanId).trim().toLowerCase();
+    const fsUrl = typeof fsCfg.formEndpoint === 'string' ? fsCfg.formEndpoint.trim() : '';
+    if (fsTenant === cleanId && fsUrl.startsWith('http')) {
+      return fsUrl;
+    }
+  }
+
+  const initCfg = options.initialConfig;
+  if (initCfg && (initCfg.clientId || '').trim().toLowerCase() === cleanId) {
+    const initUrl = typeof initCfg.formEndpoint === 'string' ? initCfg.formEndpoint.trim() : '';
+    if (initUrl.startsWith('http')) {
+      return initUrl;
+    }
+  }
+
+  const presetCfg = options.presetConfig;
+  if (presetCfg && (presetCfg.clientId || cleanId).trim().toLowerCase() === cleanId) {
+    const presetUrl = typeof presetCfg.formEndpoint === 'string' ? presetCfg.formEndpoint.trim() : '';
+    if (presetUrl.startsWith('http')) {
+      return presetUrl;
+    }
+  }
+
+  return getEnvFormEndpointForTenant(cleanId, options.env);
+}

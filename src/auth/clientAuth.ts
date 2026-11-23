@@ -181,25 +181,11 @@ export async function getOrProvisionUserProfile(user: FirebaseUser, desiredTenan
 }
 
 /**
- * Get active client session
+ * Get active client session ONLY after real Firestore user profile resolution.
+ * Never guesses tenantId or role from an email address.
  */
 export function getCurrentClientSession(): ClientUser | null {
-  if (activeSessionUser) return activeSessionUser;
-
-  const currentFbUser = auth.currentUser;
-  if (!currentFbUser) return null;
-
-  const tenantId = inferTenantFromEmail(currentFbUser.email || '');
-  const businessName = TENANT_METADATA_MAP[tenantId]?.businessName || 'Business Client Portal';
-
-  return {
-    userId: currentFbUser.uid,
-    email: currentFbUser.email || '',
-    clientId: tenantId,
-    businessName,
-    role: 'client_admin',
-    createdAt: new Date().toISOString(),
-  };
+  return activeSessionUser;
 }
 
 /**
@@ -213,9 +199,8 @@ export function onClientAuthStateChanged(callback: (user: ClientUser | null) => 
         activeSessionUser = user;
         callback(user);
       } catch {
-        const fallback = getCurrentClientSession();
-        activeSessionUser = fallback;
-        callback(fallback);
+        activeSessionUser = null;
+        callback(null);
       }
     } else {
       activeSessionUser = null;
@@ -342,31 +327,101 @@ export async function logoutClient(): Promise<void> {
   window.dispatchEvent(new Event('leadpilot_auth_changed'));
 }
 
-/**
- * Server-side verification of platform administrator permissions.
- * Verifies against Firestore /admins/{uid} collection and cryptographically verified root admin Google token.
- */
-export async function verifyServerAdminStatus(user: FirebaseUser | null): Promise<boolean> {
-  if (!user) return false;
+export const ROOT_ADMIN_EMAIL = 'mail.nasiya@gmail.com';
 
-  // 1. Root platform admin verification (matches firestore.rules isRootAdmin())
-  const userEmail = (user.email || '').toLowerCase().trim();
-  if (userEmail === 'mail.nasiya@gmail.com') {
-    return true;
+export interface AdminCapabilities {
+  isRootAdmin: boolean;
+  isAdmin: boolean;
+}
+
+/**
+ * Pure helper evaluating whether Firebase auth attributes satisfy Root Admin requirements
+ * matching firestore.rules isRootAdmin():
+ * - exact email 'mail.nasiya@gmail.com'
+ * - emailVerified === true
+ * - signInProvider === 'google.com'
+ */
+export function matchesRootAdminIdentity(params: {
+  email?: string | null;
+  emailVerified?: boolean;
+  signInProvider?: string | null;
+  providerIds?: string[];
+}): boolean {
+  const cleanEmail = (params.email || '').toLowerCase().trim();
+  if (cleanEmail !== ROOT_ADMIN_EMAIL) return false;
+  if (params.emailVerified !== true) return false;
+
+  if (params.signInProvider !== undefined && params.signInProvider !== null) {
+    return params.signInProvider === 'google.com';
+  }
+  return Array.isArray(params.providerIds) && params.providerIds.includes('google.com');
+}
+
+/**
+ * Server-side verification separating Root Admin vs Provisioned Admin capabilities.
+ * - isRootAdmin: strictly requires verified mail.nasiya@gmail.com signed in via google.com
+ * - isAdmin: isRootAdmin OR provisioned document in /admins/{uid}
+ */
+export async function verifyServerAdminCapabilities(
+  user: FirebaseUser | null
+): Promise<AdminCapabilities> {
+  if (!user) {
+    return { isRootAdmin: false, isAdmin: false };
   }
 
-  // 2. Database verification against /admins/{uid}
+  let signInProvider: string | null = null;
+  if (typeof (user as any).getIdTokenResult === 'function') {
+    try {
+      const tokenResult = await (user as any).getIdTokenResult();
+      signInProvider = tokenResult?.signInProvider || null;
+    } catch {
+      signInProvider = null;
+    }
+  }
+
+  const providerIds = Array.isArray(user.providerData)
+    ? user.providerData.map((p) => p?.providerId).filter((id): id is string => Boolean(id))
+    : [];
+
+  if (
+    matchesRootAdminIdentity({
+      email: user.email,
+      emailVerified: user.emailVerified,
+      signInProvider,
+      providerIds,
+    })
+  ) {
+    return { isRootAdmin: true, isAdmin: true };
+  }
+
+  // Provisioned administrator lookup in /admins/{uid}
   try {
     const adminDoc = await getDoc(doc(db, 'admins', user.uid));
     if (adminDoc.exists()) {
-      return true;
+      return { isRootAdmin: false, isAdmin: true };
     }
-  } catch (err) {
-    // Permission denied or missing: not an admin
-    return false;
+  } catch {
+    return { isRootAdmin: false, isAdmin: false };
   }
 
-  return false;
+  return { isRootAdmin: false, isAdmin: false };
+}
+
+/**
+ * Strictly verify Root Administrator status (mail.nasiya@gmail.com + verified + google.com).
+ */
+export async function verifyRootAdminStatus(user: FirebaseUser | null): Promise<boolean> {
+  const caps = await verifyServerAdminCapabilities(user);
+  return caps.isRootAdmin;
+}
+
+/**
+ * Server-side verification of platform administrator permissions (Root Admin OR provisioned /admins/{uid}).
+ * Preserved for existing callers that check general admin capability.
+ */
+export async function verifyServerAdminStatus(user: FirebaseUser | null): Promise<boolean> {
+  const caps = await verifyServerAdminCapabilities(user);
+  return caps.isAdmin;
 }
 
 /**
@@ -400,6 +455,7 @@ export async function getTenantRecord(tenantId: string): Promise<TenantRecord | 
       status: resolveSafeTenantStatus(data.status),
       isPublished: Boolean(data.isPublished),
       ownerEmail: data.ownerEmail || '',
+      slug: data.slug || '',
       createdAt: data.createdAt || new Date().toISOString(),
       updatedAt: data.updatedAt,
     };
@@ -426,6 +482,7 @@ export async function listTenantRecords(): Promise<TenantRecord[]> {
         status: resolveSafeTenantStatus(data.status),
         isPublished: Boolean(data.isPublished),
         ownerEmail: data.ownerEmail || '',
+        slug: data.slug || '',
         createdAt: data.createdAt || new Date().toISOString(),
         updatedAt: data.updatedAt,
       });
@@ -453,6 +510,15 @@ export async function createTenantRecord(
     return { success: false, error: 'Tenant ID is required.' };
   }
 
+  let normalizedSlug = '';
+  if (tenant.slug && tenant.slug.trim()) {
+    const slugCheck = validateAndNormalizeSlug(tenant.slug);
+    if (!slugCheck.isValid) {
+      return { success: false, error: slugCheck.error || 'Invalid URL slug.' };
+    }
+    normalizedSlug = slugCheck.normalizedSlug;
+  }
+
   const timestamp = new Date().toISOString();
   const safeStatus = resolveSafeTenantStatus(tenant.status);
   const newRecord: TenantRecord = {
@@ -462,20 +528,30 @@ export async function createTenantRecord(
     status: safeStatus,
     isPublished: Boolean(tenant.isPublished),
     ownerEmail: tenant.ownerEmail ? tenant.ownerEmail.trim().toLowerCase() : '',
+    ...(normalizedSlug ? { slug: normalizedSlug } : {}),
     createdAt: timestamp,
     updatedAt: timestamp,
   };
 
   try {
     const tenantDocRef = doc(db, 'tenants', cleanId);
+    const slugDocRef = normalizedSlug ? doc(db, 'slugs', normalizedSlug) : null;
 
     const result = await runTransaction(db, async (transaction) => {
       const existingSnap = await transaction.get(tenantDocRef);
+      const existingSlugSnap = slugDocRef ? await transaction.get(slugDocRef) : null;
+
       if (existingSnap.exists()) {
         throw new Error(`Tenant "${cleanId}" already exists. Duplicate tenant creation rejected.`);
       }
 
-      const payload = {
+      if (existingSlugSnap && existingSlugSnap.exists()) {
+        throw new Error(
+          `Slug "${normalizedSlug}" is already registered to "${existingSlugSnap.data()?.tenantId}". Choose a different public URL slug.`
+        );
+      }
+
+      const payload: Record<string, any> = {
         id: cleanId,
         tenantId: cleanId,
         name: newRecord.businessName,
@@ -487,8 +563,21 @@ export async function createTenantRecord(
         createdAt: newRecord.createdAt,
         updatedAt: newRecord.updatedAt,
       };
+      if (normalizedSlug) {
+        payload.slug = normalizedSlug;
+      }
 
       transaction.set(tenantDocRef, payload);
+
+      if (slugDocRef && normalizedSlug) {
+        transaction.set(slugDocRef, {
+          slug: normalizedSlug,
+          tenantId: cleanId,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        });
+      }
+
       return newRecord;
     });
 
@@ -1269,68 +1358,96 @@ export async function resolveSlugToTenant(
 }
 
 /**
- * Safely create a unique slug mapping at /slugs/{slug} in an atomic transaction.
- * - Verifies the target tenant exists in /tenants/{tenantId}.
- * - Verifies the slug is not already registered to a different tenant.
- * - Atomically writes /slugs/{slug} and updates /tenants/{tenantId}.slug.
+ * Safely create or replace a unique slug mapping at /slugs/{slug} in an atomic transaction.
+ * Delegates to updateTenantSlugAtomic so any previous /slugs/{oldSlug} mapping for the tenant
+ * is retired atomically and no obsolete public URLs remain.
  */
 export async function createSlugMappingAtomic(
   slug: string,
   tenantId: string
 ): Promise<{ success: boolean; slugMapping?: SlugMapping; error?: string }> {
-  const validation = validateAndNormalizeSlug(slug);
-  if (!validation.isValid) {
-    return { success: false, error: validation.error };
-  }
+  return updateTenantSlugAtomic(tenantId, slug);
+}
 
+/**
+ * Atomically assign or change a tenant's public URL slug inside a Firestore transaction.
+ * - Reads /tenants/{tenantId} and /slugs/{newSlug} (plus any previous /slugs/{oldSlug}) before writes.
+ * - Rejects if tenant does not exist or newSlug is owned by a different tenant.
+ * - Cleans up the previous /slugs/{oldSlug} mapping when changing slugs so stale URLs fail closed.
+ * - Updates /tenants/{tenantId}.slug atomically.
+ */
+export async function updateTenantSlugAtomic(
+  tenantId: string,
+  newSlug: string
+): Promise<{ success: boolean; slugMapping?: SlugMapping; error?: string }> {
   const cleanTenantId = (tenantId || '').trim().toLowerCase();
   if (!cleanTenantId) {
     return { success: false, error: 'Tenant ID is required.' };
   }
 
+  const validation = validateAndNormalizeSlug(newSlug);
+  if (!validation.isValid) {
+    return { success: false, error: validation.error };
+  }
+
+  const normalizedNewSlug = validation.normalizedSlug;
   const timestamp = new Date().toISOString();
-  const slugRef = doc(db, 'slugs', validation.normalizedSlug);
   const tenantRef = doc(db, 'tenants', cleanTenantId);
+  const newSlugRef = doc(db, 'slugs', normalizedNewSlug);
 
   try {
     const result = await runTransaction(db, async (transaction) => {
-      // 1. All Reads First
-      const [slugSnap, tenantSnap] = await Promise.all([
-        transaction.get(slugRef),
+      // 1. Primary reads
+      const [tenantSnap, newSlugSnap] = await Promise.all([
         transaction.get(tenantRef),
+        transaction.get(newSlugRef),
       ]);
 
       if (!tenantSnap.exists()) {
-        throw new Error(`Cannot map slug "${validation.normalizedSlug}": Tenant "${cleanTenantId}" does not exist.`);
+        throw new Error(`Tenant "${cleanTenantId}" does not exist.`);
       }
 
-      if (slugSnap.exists()) {
-        const existingData = slugSnap.data();
-        if (existingData?.tenantId !== cleanTenantId) {
-          throw new Error(
-            `Slug "${validation.normalizedSlug}" is already registered to a different tenant ("${existingData?.tenantId}"). Duplicate slug ownership prevented.`
-          );
-        }
-        // Already cleanly mapped to this tenant (idempotent)
-        return {
-          slug: validation.normalizedSlug,
+      if (newSlugSnap.exists() && newSlugSnap.data()?.tenantId !== cleanTenantId) {
+        throw new Error(
+          `Slug "${normalizedNewSlug}" is already assigned to another tenant ("${newSlugSnap.data()?.tenantId}").`
+        );
+      }
+
+      const previousSlug =
+        typeof tenantSnap.data()?.slug === 'string'
+          ? tenantSnap.data().slug.trim().toLowerCase()
+          : '';
+      const hasOldSlugToRemove = Boolean(previousSlug && previousSlug !== normalizedNewSlug);
+      const oldSlugRef = hasOldSlugToRemove ? doc(db, 'slugs', previousSlug) : null;
+      const oldSlugSnap = oldSlugRef ? await transaction.get(oldSlugRef) : null;
+
+      // 2. Atomic writes
+      let slugRecord: SlugMapping;
+      if (newSlugSnap.exists()) {
+        const existingData = newSlugSnap.data();
+        slugRecord = {
+          slug: normalizedNewSlug,
           tenantId: cleanTenantId,
-          createdAt: existingData.createdAt || timestamp,
-          updatedAt: existingData.updatedAt || timestamp,
-        } as SlugMapping;
+          createdAt: existingData?.createdAt || timestamp,
+          updatedAt: timestamp,
+        };
+        transaction.update(newSlugRef, { updatedAt: timestamp });
+      } else {
+        slugRecord = {
+          slug: normalizedNewSlug,
+          tenantId: cleanTenantId,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        transaction.set(newSlugRef, slugRecord);
       }
 
-      // 2. Writes
-      const slugRecord: SlugMapping = {
-        slug: validation.normalizedSlug,
-        tenantId: cleanTenantId,
-        createdAt: timestamp,
-        updatedAt: timestamp,
-      };
+      if (oldSlugRef && oldSlugSnap && oldSlugSnap.exists() && oldSlugSnap.data()?.tenantId === cleanTenantId) {
+        transaction.delete(oldSlugRef);
+      }
 
-      transaction.set(slugRef, slugRecord);
       transaction.update(tenantRef, {
-        slug: validation.normalizedSlug,
+        slug: normalizedNewSlug,
         updatedAt: timestamp,
       });
 
@@ -1341,7 +1458,7 @@ export async function createSlugMappingAtomic(
   } catch (err: any) {
     return {
       success: false,
-      error: err?.message || 'Failed to create slug mapping.',
+      error: err?.message || 'Failed to update tenant public URL slug.',
     };
   }
 }

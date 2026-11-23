@@ -360,12 +360,21 @@ export function generateLeadId(existingCount: number = 0): string {
   return candidate;
 }
 
+export interface SaveLeadOptions {
+  persistLeadToFirestore?: (params: {
+    tenantId: string;
+    leadId: string;
+    payload: Record<string, any>;
+  }) => Promise<void>;
+}
+
 /**
  * Save a new lead or update an existing lead with Firestore persistence
  */
 export async function saveLead(
   input: Partial<LeadItem> & { name: string; phone: string; service: string },
-  endpointUrl?: string
+  endpointUrl?: string,
+  options?: SaveLeadOptions
 ): Promise<{ success: boolean; message: string; lead: LeadItem }> {
   if (!input.clientId || !input.clientId.trim()) {
     return {
@@ -449,8 +458,6 @@ export async function saveLead(
   // 2. Persist to Firestore: /tenants/{tenantId}/leads/{leadId}
   let firestoreErrDetail: string | null = null;
   try {
-    const leadDocRef = doc(db, 'tenants', targetTenant, 'leads', targetLead.id);
-    
     // Decouple public landing submissions from CRM internal audit fields:
     // If submission is unauthenticated (anonymous public visitor), write ONLY the approved 13 public fields.
     // Internal CRM fields (notes, contactCount, contactLogs) are excluded from the public Firestore write
@@ -473,7 +480,16 @@ export async function saveLead(
           status: targetLead.status, // Strictly 'New'
         });
 
-    await setDoc(leadDocRef, firestorePayload, { merge: true });
+    if (options?.persistLeadToFirestore) {
+      await options.persistLeadToFirestore({
+        tenantId: targetTenant,
+        leadId: targetLead.id,
+        payload: firestorePayload,
+      });
+    } else {
+      const leadDocRef = doc(db, 'tenants', targetTenant, 'leads', targetLead.id);
+      await setDoc(leadDocRef, firestorePayload, { merge: true });
+    }
   } catch (firestoreErr: any) {
     console.error('Error persisting lead to Firestore:', firestoreErr);
     firestoreErrDetail = firestoreErr?.message || 'Database permission or connection error';
@@ -951,13 +967,80 @@ export async function testGoogleSheetConnection(endpointUrl: string): Promise<{
 }
 
 /**
+ * Detect whether the app is running behind the Cloudflare Pages / production secure gateway (/api/sync-sheet).
+ */
+export function isCloudflareGatewayMode(): boolean {
+  const isBrowser = typeof window !== 'undefined';
+  if (!isBrowser) return false;
+  const isProd = Boolean((import.meta as any).env?.PROD);
+  const hostname = window.location?.hostname || '';
+  const isCloudflarePages =
+    hostname.endsWith('.pages.dev') ||
+    hostname.includes('leadpilot') ||
+    (import.meta as any).env?.VITE_HOSTING_PLATFORM === 'cloudflare';
+  return isCloudflarePages || (isProd && Boolean(auth.currentUser));
+}
+
+/**
  * POST action to remote Google Apps Script backend
- * Accounts for cross-origin response limitations with fallback handling
+ * Accounts for cross-origin response limitations and Cloudflare secure gateway proxying
  */
 export async function syncLeadActionToRemote(
   endpointUrl: string | undefined,
   payload: Record<string, any>
 ): Promise<{ success: boolean; result?: any; message: string }> {
+  const action = (payload?.action || 'createLead').toString();
+  const cleanTenant = (payload?.clientId || '').toString().trim().toLowerCase();
+
+  // In Cloudflare Pages / production, authenticated CRM mutations (non-createLead) MUST go through
+  // /api/sync-sheet so the server attaches the tenant's private Apps Script API_KEY safely.
+  if (action !== 'createLead' && cleanTenant && isCloudflareGatewayMode() && auth.currentUser) {
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      if (!idToken) {
+        return { success: false, message: 'Authentication error: Unable to retrieve active Firebase ID token.' };
+      }
+
+      const proxyRes = await fetch('/api/sync-sheet', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          ...payload,
+          action,
+          clientId: cleanTenant,
+        }),
+      });
+
+      let proxyJson: any = null;
+      try {
+        proxyJson = await proxyRes.json();
+      } catch {
+        // ignore JSON parse error
+      }
+
+      const isSuccess = Boolean(
+        proxyRes.ok &&
+          proxyJson &&
+          (proxyJson.result === 'success' || proxyJson.status === 'success' || proxyJson.status === 'ok')
+      );
+      return {
+        success: isSuccess,
+        result: proxyJson,
+        message:
+          proxyJson?.message ||
+          (isSuccess ? 'Synced to Google Sheet via secure gateway' : `Gateway rejected sync (HTTP ${proxyRes.status})`),
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: `Security gateway (/api/sync-sheet) error: ${err?.message || 'Network error'}`,
+      };
+    }
+  }
+
   if (!endpointUrl || !endpointUrl.trim() || !endpointUrl.startsWith('http')) {
     return { success: false, message: 'Google Apps Script URL is missing or unconfigured in CONFIG.formEndpoint.' };
   }
@@ -1066,7 +1149,10 @@ export async function fetchRemoteSheetLeads(
   message: string;
   totalRows?: number;
 }> {
-  if (!endpointUrl || !endpointUrl.trim() || !endpointUrl.startsWith('http')) {
+  const useSecureGateway = isCloudflareGatewayMode();
+  const cleanEndpoint = typeof endpointUrl === 'string' ? endpointUrl.trim() : '';
+
+  if (!useSecureGateway && (!cleanEndpoint || !cleanEndpoint.startsWith('http'))) {
     return {
       success: false,
       leads: [],
@@ -1077,17 +1163,10 @@ export async function fetchRemoteSheetLeads(
   const cleanTenant = (tenantId || 'roofing-client-01').trim().toLowerCase();
 
   // 1. Cloudflare Pages Production Gateway Flow:
-  const isBrowser = typeof window !== 'undefined';
-  const isProd = Boolean((import.meta as any).env?.PROD);
-  const isCloudflarePages = isBrowser && (
-    window.location.hostname.endsWith('.pages.dev') ||
-    window.location.hostname.includes('leadpilot') ||
-    (import.meta as any).env?.VITE_HOSTING_PLATFORM === 'cloudflare'
-  );
-
   // In Cloudflare production, all CRM Google Sheets sync must go through /api/sync-sheet.
+  // Server environment variables (APPSCRIPT_ENDPOINT_<TENANT> / APPSCRIPT_KEY_<TENANT>) supply credentials.
   // Direct fallback to browser Apps Script fetch is strictly prohibited.
-  if (isBrowser && (isCloudflarePages || (isProd && auth.currentUser))) {
+  if (useSecureGateway) {
     if (!auth.currentUser) {
       return {
         success: false,
@@ -1106,17 +1185,21 @@ export async function fetchRemoteSheetLeads(
         };
       }
 
+      const proxyBody: Record<string, any> = {
+        action: 'getLeads',
+        clientId: cleanTenant,
+      };
+      if (cleanEndpoint) {
+        proxyBody.endpointUrl = cleanEndpoint;
+      }
+
       const proxyRes = await fetch('/api/sync-sheet', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${idToken}`,
         },
-        body: JSON.stringify({
-          action: 'getLeads',
-          clientId: cleanTenant,
-          endpointUrl: endpointUrl.trim(),
-        }),
+        body: JSON.stringify(proxyBody),
       });
 
       let proxyJson: any = null;
@@ -1232,8 +1315,10 @@ export async function syncGoogleSheetToCrm(
 ): Promise<SheetSyncSummary> {
   const cleanTenant = (tenantId || 'prodrain-plumbing-kochi').trim().toLowerCase();
   const nowStr = new Date().toLocaleTimeString();
+  const useSecureGateway = isCloudflareGatewayMode();
+  const cleanEndpoint = typeof endpointUrl === 'string' ? endpointUrl.trim() : '';
 
-  if (!endpointUrl || !endpointUrl.trim() || !endpointUrl.startsWith('http')) {
+  if (!useSecureGateway && (!cleanEndpoint || !cleanEndpoint.startsWith('http'))) {
     return {
       success: false,
       message: 'Google Apps Script URL is missing or unconfigured in CONFIG.formEndpoint.',
@@ -1248,7 +1333,7 @@ export async function syncGoogleSheetToCrm(
   }
 
   // 1. Fetch remote sheet rows
-  const remoteRes = await fetchRemoteSheetLeads(endpointUrl, cleanTenant, options?.apiKey);
+  const remoteRes = await fetchRemoteSheetLeads(cleanEndpoint, cleanTenant, options?.apiKey);
   if (!remoteRes.success) {
     return {
       success: false,

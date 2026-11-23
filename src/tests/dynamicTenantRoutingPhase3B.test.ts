@@ -13,15 +13,19 @@
  * 7. saveLead fails closed if clientId is missing or invalid.
  */
 
+import fs from 'fs';
+import path from 'path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   parseAppRoute,
   getAppTarget,
   extractTenantSlugFromPath,
+  resolveCurrentTenantId,
 } from '../config/appTarget';
 import {
   hydratePublicClientConfig,
   resolvePublicTenantWebsiteBySlug,
+  validateAndNormalizeSlug,
 } from '../auth/clientAuth';
 import { saveLead } from '../utils/leadStorage';
 
@@ -43,15 +47,15 @@ describe('Phase 3B: Dynamic Public Tenant Routing Suite', () => {
   // =========================================================================
   describe('Section 1: Single-Segment Public URLs & CRM Priority', () => {
     it('1. Supports single-segment public tenant URLs when VITE_APP_TARGET is unset', () => {
-      for (const path of ['/apex-hvac', '/tarot-kochi', '/prodrain-plumbing']) {
-        const route = parseAppRoute(path);
-        const expectedSlug = path.slice(1);
+      for (const routePath of ['/apex-hvac', '/tarot-kochi', '/prodrain-plumbing', '/demo-tarot-kochi']) {
+        const route = parseAppRoute(routePath);
+        const expectedSlug = routePath.slice(1);
         expect(route.isCrmRoute).toBe(false);
         expect(route.isReserved).toBe(false);
         expect(route.isMultiSegment).toBe(false);
         expect(route.tenantSlug).toBe(expectedSlug);
-        expect(extractTenantSlugFromPath(path)).toBe(expectedSlug);
-        expect(getAppTarget(path)).toBe('landing');
+        expect(extractTenantSlugFromPath(routePath)).toBe(expectedSlug);
+        expect(getAppTarget(routePath)).toBe('landing');
       }
     });
 
@@ -269,6 +273,40 @@ describe('Phase 3B: Dynamic Public Tenant Routing Suite', () => {
         clientId: '../evil-tenant',
       });
       expect(badFormatRes.success).toBe(false);
+    });
+  });
+
+  // =========================================================================
+  // SECTION 4: CLOUDFLARE STAGING HOSTNAME & NULL-SAFE SLUG RULES GUARD
+  // =========================================================================
+  describe('Section 4: Staging Hostname Isolation & Rules Integrity', () => {
+    it('1. Shared .pages.dev staging/preview hostnames never accept single-tenant env override in production', () => {
+      process.env.VITE_SINGLE_TENANT_MODE = 'true';
+      process.env.VITE_CLIENT_ID = 'client-apex-hvac';
+
+      expect(resolveCurrentTenantId('leadpilot-staging.pages.dev', true)).toEqual({
+        tenantId: '',
+        isValid: false,
+      });
+      expect(resolveCurrentTenantId('abc123.leadpilot-staging.pages.dev', true)).toEqual({
+        tenantId: '',
+        isValid: false,
+      });
+    });
+
+    it('2. validateAndNormalizeSlug accepts demo-tarot-kochi as a valid tenant slug', () => {
+      expect(validateAndNormalizeSlug('demo-tarot-kochi')).toEqual({
+        isValid: true,
+        normalizedSlug: 'demo-tarot-kochi',
+      });
+    });
+
+    it('3. firestore.rules handles non-existent slugs safely while enforcing active + published checks on existing slugs', () => {
+      const rules = fs.readFileSync(path.resolve(process.cwd(), 'firestore.rules'), 'utf8');
+      const slugMatchBlock = rules.match(/match \/slugs\/\{slug\}\s*\{[\s\S]*?allow list:/)?.[0] || '';
+      expect(slugMatchBlock).toContain('resource == null');
+      expect(slugMatchBlock).toContain('isSlugTenantActive(resource.data.tenantId)');
+      expect(slugMatchBlock).toContain('isSlugTenantWebsitePublished(resource.data.tenantId)');
     });
   });
 });

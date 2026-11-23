@@ -11,8 +11,8 @@ import {
   PagesContext,
 } from '../../functions/api/sync-sheet';
 import { resolveCurrentTenantId, REGISTERED_HOSTNAME_MAP, getAuthoritativeTenantConfig } from '../config/appTarget';
-import { getClientConfigForEnvClientId } from '../config/clientConfigResolver';
-import { fetchRemoteSheetLeads } from '../utils/leadStorage';
+import { getClientConfigForEnvClientId, resolveTenantFormEndpoint } from '../config/clientConfigResolver';
+import { fetchRemoteSheetLeads, syncGoogleSheetToCrm } from '../utils/leadStorage';
 
 describe('Cloudflare Pages Functions: Critical Security Gateway Test Suite', () => {
   const PROJECT_ID = 'bamboo-tangent-x8gvj';
@@ -743,5 +743,78 @@ describe('Cloudflare Pages Functions: Critical Security Gateway Test Suite', () 
       (global as any).window = origWindow;
     }
   });
-});
 
+  // --------------------------------------------------------------------------
+  // SECTION 8: Google Sheets CONFIG.formEndpoint Resolution & Tenant Isolation
+  // --------------------------------------------------------------------------
+  it('35. formEndpoint Resolution: Firestore config overrides preset for demo-tarot-kochi', () => {
+    const resolved = resolveTenantFormEndpoint({
+      tenantId: 'demo-tarot-kochi',
+      firestoreConfig: {
+        clientId: 'demo-tarot-kochi',
+        formEndpoint: 'https://script.google.com/macros/s/AKfy_example_tarot_live/exec',
+      },
+      env: {
+        VITE_FORM_ENDPOINT_TAROT: 'https://script.google.com/macros/s/AKfy_example_tarot_env/exec',
+      },
+    });
+    expect(resolved).toBe('https://script.google.com/macros/s/AKfy_example_tarot_live/exec');
+  });
+
+  it('36. formEndpoint Resolution: Cross-tenant firestoreConfig is strictly rejected', () => {
+    const resolved = resolveTenantFormEndpoint({
+      tenantId: 'demo-tarot-kochi',
+      firestoreConfig: {
+        clientId: 'prodrain-plumbing-kochi',
+        formEndpoint: 'https://script.google.com/macros/s/AKfy_prodrain_only/exec',
+      },
+      env: {},
+    });
+    expect(resolved).toBe('');
+  });
+
+  it('37. formEndpoint Resolution: VITE_FORM_ENDPOINT_TAROT applies to demo-tarot-kochi without leaking to unrelated tenants', () => {
+    const env = {
+      VITE_FORM_ENDPOINT_TAROT: 'https://script.google.com/macros/s/AKfy_tarot_only/exec',
+      VITE_FORM_ENDPOINT: 'https://script.google.com/macros/s/AKfy_shared_fallback/exec',
+    };
+
+    const tarotEndpoint = resolveTenantFormEndpoint({ tenantId: 'demo-tarot-kochi', env });
+    const hvacEndpoint = resolveTenantFormEndpoint({ tenantId: 'client-apex-hvac', env });
+
+    expect(tarotEndpoint).toBe('https://script.google.com/macros/s/AKfy_tarot_only/exec');
+    expect(hvacEndpoint).toBe('');
+  });
+
+  it('38. Cloudflare Gateway Env Resolution: Resolves demo-tarot-kochi server secrets and returns null when unconfigured', () => {
+    const configured = resolveTenantAppsScriptConfig('demo-tarot-kochi', {
+      APPSCRIPT_ENDPOINT_DEMO_TAROT_KOCHI: 'https://script.google.com/macros/s/AKfy_tarot_srv/exec',
+      APPSCRIPT_KEY_DEMO_TAROT_KOCHI: 'server_secret_tarot_key',
+    });
+    expect(configured).toEqual({
+      endpointUrl: 'https://script.google.com/macros/s/AKfy_tarot_srv/exec',
+      apiKey: 'server_secret_tarot_key',
+    });
+
+    const missing = resolveTenantAppsScriptConfig('demo-tarot-kochi', {
+      APPSCRIPT_ENDPOINT_PRODRAIN_PLUMBING_KOCHI: 'https://script.google.com/macros/s/AKfy_prodrain/exec',
+      APPSCRIPT_KEY_PRODRAIN_PLUMBING_KOCHI: 'server_secret_prodrain_key',
+    });
+    expect(missing).toBeNull();
+  });
+
+  it('39. Cloudflare Staging Mode: Empty browser formEndpoint defers to /api/sync-sheet gateway auth rather than local error', async () => {
+    const origWindow = (global as any).window;
+    try {
+      (global as any).window = {
+        location: { hostname: 'leadpilot-staging.pages.dev' },
+      };
+
+      const res = await syncGoogleSheetToCrm('', 'demo-tarot-kochi');
+      expect(res.success).toBe(false);
+      expect(res.message).toContain('Authentication required');
+    } finally {
+      (global as any).window = origWindow;
+    }
+  });
+});

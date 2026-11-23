@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { ClientConfig } from '../types';
 import { saveLead, getStoredLeads } from '../utils/leadStorage';
+import { resolveTenantFormEndpoint } from '../config/clientConfigResolver';
 import {
   Phone,
   Clock,
@@ -118,7 +119,6 @@ export const LiveWebsitePreview: React.FC<LiveWebsitePreviewProps> = ({ config, 
     setFormError(null);
 
     // Formatted payload structured for Google Apps Script / Google Sheets & LeadPilot mapping
-    const endpoint = (config.formEndpoint || (import.meta as any).env?.VITE_FORM_ENDPOINT || '').trim();
     const resolvedClientId = (config.clientId || '').trim().toLowerCase();
     const cleanTenant = appMode === 'client'
       ? resolvedClientId
@@ -129,6 +129,11 @@ export const LiveWebsitePreview: React.FC<LiveWebsitePreviewProps> = ({ config, 
       setFormSubmitting(false);
       return;
     }
+
+    const endpoint = resolveTenantFormEndpoint({
+      tenantId: cleanTenant,
+      firestoreConfig: config,
+    });
 
     const cleanEmail = formData.email ? formData.email.trim() : '';
 

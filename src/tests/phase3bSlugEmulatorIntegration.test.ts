@@ -25,10 +25,13 @@ import {
   deleteDoc,
   getDocs,
   collection,
+  runTransaction,
 } from 'firebase/firestore';
 import {
   validateAndNormalizeSlug,
   RESERVED_SLUGS,
+  matchesRootAdminIdentity,
+  getCurrentClientSession,
 } from '../auth/clientAuth';
 
 const isEmulatorRunning = Boolean(process.env.FIRESTORE_EMULATOR_HOST);
@@ -67,6 +70,47 @@ describe('Phase 3B: Slug Validation & Normalization Logic', () => {
       expect(res.error).toContain('reserved');
     }
   });
+
+  it('6. Root Admin identity requires verified mail.nasiya@gmail.com via google.com provider', () => {
+    expect(
+      matchesRootAdminIdentity({
+        email: 'mail.nasiya@gmail.com',
+        emailVerified: true,
+        signInProvider: 'google.com',
+      })
+    ).toBe(true);
+
+    // Unverified email rejected
+    expect(
+      matchesRootAdminIdentity({
+        email: 'mail.nasiya@gmail.com',
+        emailVerified: false,
+        signInProvider: 'google.com',
+      })
+    ).toBe(false);
+
+    // Non-Google sign-in provider rejected even for Root Admin email
+    expect(
+      matchesRootAdminIdentity({
+        email: 'mail.nasiya@gmail.com',
+        emailVerified: true,
+        signInProvider: 'password',
+      })
+    ).toBe(false);
+
+    // Provisioned admin email is never treated as Root Admin
+    expect(
+      matchesRootAdminIdentity({
+        email: 'support-admin@leadpilot.io',
+        emailVerified: true,
+        signInProvider: 'google.com',
+      })
+    ).toBe(false);
+  });
+
+  it('7. getCurrentClientSession returns null instead of guessing tenantId before Firestore profile loads', () => {
+    expect(getCurrentClientSession()).toBeNull();
+  });
 });
 
 // Real Firestore Emulator Security Integration Suite
@@ -86,6 +130,8 @@ describe.skipIf(!isEmulatorRunning)(
     const SLUG_UNPUBLISHED = 'draft-biz';
     const ROOT_ADMIN_UID = 'admin_root_uid';
     const ROOT_ADMIN_EMAIL = 'mail.nasiya@gmail.com';
+    const PROVISIONED_ADMIN_UID = 'admin_provisioned_uid';
+    const PROVISIONED_ADMIN_EMAIL = 'ops-admin@leadpilot.local';
     const TENANT_OWNER_UID = 'usr_apex_owner';
 
     beforeAll(async () => {
@@ -113,10 +159,15 @@ describe.skipIf(!isEmulatorRunning)(
         await testEnv.withSecurityRulesDisabled(async (context) => {
           const db = context.firestore();
 
-          // 1. Root Admin
+          // 1. Root Admin & Provisioned Admin
           await setDoc(doc(db, 'admins', ROOT_ADMIN_UID), {
             uid: ROOT_ADMIN_UID,
             email: ROOT_ADMIN_EMAIL,
+            role: 'admin',
+          });
+          await setDoc(doc(db, 'admins', PROVISIONED_ADMIN_UID), {
+            uid: PROVISIONED_ADMIN_UID,
+            email: PROVISIONED_ADMIN_EMAIL,
             role: 'admin',
           });
 
@@ -417,6 +468,158 @@ describe.skipIf(!isEmulatorRunning)(
 
       // Tenant A owner CANNOT read Tenant B leads (e.g. if navigating to /crm/draft-co)
       await assertFails(getDocs(collection(ownerADb, 'tenants', TENANT_UNPUBLISHED, 'leads')));
+    });
+
+    // --------------------------------------------------------------------------
+    // SCENARIO 12: Root Admin Atomic Tenant Creation With & Without Slug (existsAfter)
+    // --------------------------------------------------------------------------
+    it('12. Root Admin can atomically create a new tenant with a slug (using existsAfter) and without a slug', async () => {
+      const rootAdminDb = testEnv.authenticatedContext(ROOT_ADMIN_UID, {
+        email: ROOT_ADMIN_EMAIL,
+        email_verified: true,
+        firebase: { sign_in_provider: 'google.com' },
+      }).firestore();
+
+      // With slug inside single transaction
+      const newTenantId = 'tenant-atomic-dental';
+      const newSlug = 'atomic-dental';
+      await assertSucceeds(
+        runTransaction(rootAdminDb, async (txn) => {
+          txn.set(doc(rootAdminDb, 'tenants', newTenantId), {
+            id: newTenantId,
+            tenantId: newTenantId,
+            name: 'Atomic Dental',
+            status: 'active',
+            isPublished: false,
+            slug: newSlug,
+            createdAt: '2026-11-21T00:00:00Z',
+          });
+          txn.set(doc(rootAdminDb, 'slugs', newSlug), {
+            slug: newSlug,
+            tenantId: newTenantId,
+            createdAt: '2026-11-21T00:00:00Z',
+            updatedAt: '2026-11-21T00:00:00Z',
+          });
+        })
+      );
+
+      // Without slug
+      const sluglessTenantId = 'tenant-slugless-clinic';
+      await assertSucceeds(
+        setDoc(doc(rootAdminDb, 'tenants', sluglessTenantId), {
+          id: sluglessTenantId,
+          tenantId: sluglessTenantId,
+          name: 'Slugless Clinic',
+          status: 'active',
+          isPublished: false,
+          createdAt: '2026-11-21T00:00:00Z',
+        })
+      );
+    });
+
+    // --------------------------------------------------------------------------
+    // SCENARIO 13: Provisioned Admin Restrictions & Retained CRM Permissions
+    // --------------------------------------------------------------------------
+    it('13. Provisioned Admin retains CRM access but CANNOT create/delete tenants or modify slugs/ownership/status', async () => {
+      const provAdminDb = testEnv.authenticatedContext(PROVISIONED_ADMIN_UID, {
+        email: PROVISIONED_ADMIN_EMAIL,
+        email_verified: true,
+        firebase: { sign_in_provider: 'google.com' },
+      }).firestore();
+
+      // Retained CRM permissions: can read tenant metadata and leads
+      await assertSucceeds(getDoc(doc(provAdminDb, 'tenants', TENANT_ACTIVE)));
+      await assertSucceeds(getDocs(collection(provAdminDb, 'tenants', TENANT_ACTIVE, 'leads')));
+
+      // Blocked Root Admin permissions:
+      // 1) Cannot create tenant
+      await assertFails(
+        setDoc(doc(provAdminDb, 'tenants', 'tenant-prov-blocked'), {
+          id: 'tenant-prov-blocked',
+          tenantId: 'tenant-prov-blocked',
+          name: 'Blocked Co',
+          status: 'active',
+          isPublished: false,
+        })
+      );
+
+      // 2) Cannot delete tenant
+      await assertFails(deleteDoc(doc(provAdminDb, 'tenants', TENANT_ACTIVE)));
+
+      // 3) Cannot create/update/delete /slugs/{slug}
+      await assertFails(
+        setDoc(doc(provAdminDb, 'slugs', 'prov-slug'), {
+          slug: 'prov-slug',
+          tenantId: TENANT_ACTIVE,
+          createdAt: '2026-11-21T00:00:00Z',
+        })
+      );
+      await assertFails(deleteDoc(doc(provAdminDb, 'slugs', SLUG_ACTIVE)));
+
+      // 4) Cannot modify slug, status, isPublished, id, tenantId, ownerEmail on /tenants/{tenantId}
+      await assertFails(updateDoc(doc(provAdminDb, 'tenants', TENANT_ACTIVE), { slug: 'hijacked-slug' }));
+      await assertFails(updateDoc(doc(provAdminDb, 'tenants', TENANT_ACTIVE), { ownerEmail: 'evil@local' }));
+      await assertFails(updateDoc(doc(provAdminDb, 'tenants', TENANT_ACTIVE), { status: 'suspended' }));
+    });
+
+    // --------------------------------------------------------------------------
+    // SCENARIO 14: Tenant Owner Protected Fields
+    // --------------------------------------------------------------------------
+    it('14. Tenant Owner CANNOT modify slug, status, isPublished, id, tenantId, or ownerEmail on /tenants/{tenantId}', async () => {
+      const ownerDb = testEnv.authenticatedContext(TENANT_OWNER_UID, {
+        email: 'owner@apex.local',
+        email_verified: true,
+        firebase: { sign_in_provider: 'password' },
+      }).firestore();
+
+      await assertFails(updateDoc(doc(ownerDb, 'tenants', TENANT_ACTIVE), { slug: 'owner-hijack-slug' }));
+      await assertFails(updateDoc(doc(ownerDb, 'tenants', TENANT_ACTIVE), { ownerEmail: 'other@apex.local' }));
+      await assertFails(updateDoc(doc(ownerDb, 'tenants', TENANT_ACTIVE), { tenantId: 'other-tenant' }));
+      await assertFails(updateDoc(doc(ownerDb, 'tenants', TENANT_ACTIVE), { status: 'suspended' }));
+      await assertFails(updateDoc(doc(ownerDb, 'tenants', TENANT_ACTIVE), { isPublished: false }));
+    });
+
+    // --------------------------------------------------------------------------
+    // SCENARIO 15: Atomic Slug Replacement Retires Old Public URL
+    // --------------------------------------------------------------------------
+    it('15. Root Admin replacing slug atomically retires old /slugs/{oldSlug} mapping', async () => {
+      const rootAdminDb = testEnv.authenticatedContext(ROOT_ADMIN_UID, {
+        email: ROOT_ADMIN_EMAIL,
+        email_verified: true,
+        firebase: { sign_in_provider: 'google.com' },
+      }).firestore();
+      const publicDb = testEnv.unauthenticatedContext().firestore();
+
+      const replacementSlug = 'apex-hvac-pro';
+      await assertSucceeds(
+        runTransaction(rootAdminDb, async (txn) => {
+          const tenantRef = doc(rootAdminDb, 'tenants', TENANT_ACTIVE);
+          const tenantSnap = await txn.get(tenantRef);
+          const oldSlug = tenantSnap.data()?.slug;
+          if (oldSlug && oldSlug !== replacementSlug) {
+            txn.delete(doc(rootAdminDb, 'slugs', oldSlug));
+          }
+          txn.set(doc(rootAdminDb, 'slugs', replacementSlug), {
+            slug: replacementSlug,
+            tenantId: TENANT_ACTIVE,
+            createdAt: '2026-11-21T00:00:00Z',
+            updatedAt: '2026-11-21T00:00:00Z',
+          });
+          txn.update(tenantRef, {
+            slug: replacementSlug,
+            updatedAt: '2026-11-21T00:00:00Z',
+          });
+        })
+      );
+
+      // New slug resolves cleanly for public visitor
+      const newSlugSnap = await assertSucceeds(getDoc(doc(publicDb, 'slugs', replacementSlug)));
+      expect(newSlugSnap.exists()).toBe(true);
+      expect(newSlugSnap.data()?.tenantId).toBe(TENANT_ACTIVE);
+
+      // Retired old slug no longer exists
+      const oldSlugSnap = await assertSucceeds(getDoc(doc(publicDb, 'slugs', SLUG_ACTIVE)));
+      expect(oldSlugSnap.exists()).toBe(false);
     });
   }
 );

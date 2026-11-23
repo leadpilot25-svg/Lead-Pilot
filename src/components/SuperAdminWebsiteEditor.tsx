@@ -8,8 +8,11 @@ import {
   publishTenantWebsiteAtomic,
   unpublishTenantWebsiteAtomic,
   fetchPublicWebsiteConfig,
-  verifyServerAdminStatus,
+  verifyServerAdminCapabilities,
+  verifyRootAdminStatus,
   getTenantRecord,
+  updateTenantSlugAtomic,
+  validateAndNormalizeSlug,
 } from '../auth/clientAuth';
 import { auth } from '../firebase';
 import { INDUSTRY_PRESETS } from '../presets/industryPresets';
@@ -32,10 +35,12 @@ import {
   Building2,
   ShieldCheck,
   FileText,
+  Link2,
 } from 'lucide-react';
 
 interface SuperAdminWebsiteEditorProps {
   tenant: TenantRecord;
+  isRootAdmin?: boolean;
   onClose: () => void;
   onSaved?: (tenantId: string) => void;
 }
@@ -56,9 +61,11 @@ function getInitialPresetConfig(tenant: TenantRecord): ClientConfig {
 
 export const SuperAdminWebsiteEditor: React.FC<SuperAdminWebsiteEditorProps> = ({
   tenant,
+  isRootAdmin = false,
   onClose,
   onSaved,
 }) => {
+  const [verifiedRootAdmin, setVerifiedRootAdmin] = useState<boolean>(false);
   const [config, setConfig] = useState<ClientConfig>(() => getInitialPresetConfig(tenant));
   const [initialLoadedConfig, setInitialLoadedConfig] = useState<ClientConfig>(() => getInitialPresetConfig(tenant));
   const [isPublished, setIsPublished] = useState<boolean>(Boolean(tenant.isPublished));
@@ -81,6 +88,13 @@ export const SuperAdminWebsiteEditor: React.FC<SuperAdminWebsiteEditorProps> = (
     description: string;
   } | null>(null);
 
+  // Public URL Slug modal state
+  const [activeSlug, setActiveSlug] = useState<string>(tenant.slug || '');
+  const [isSlugModalOpen, setIsSlugModalOpen] = useState<boolean>(false);
+  const [slugDraftInput, setSlugDraftInput] = useState<string>((tenant.slug || tenant.tenantId || '').replace(/_/g, '-'));
+  const [slugError, setSlugError] = useState<string | null>(null);
+  const [isSavingSlug, setIsSavingSlug] = useState<boolean>(false);
+
   const isTenantActive = tenant.status === 'active';
 
   // Load existing configuration: checks private draft first, falls back to public website, then preset
@@ -91,13 +105,17 @@ export const SuperAdminWebsiteEditor: React.FC<SuperAdminWebsiteEditorProps> = (
       setIsLoading(true);
       setStatusMessage(null);
 
-      // Verify Root Admin authorization
-      const isAdmin = await verifyServerAdminStatus(auth.currentUser);
-      if (!isAdmin) {
+      // Verify strict Root Admin authorization
+      const caps = await verifyServerAdminCapabilities(auth.currentUser);
+      const rootOk = isRootAdmin && caps.isRootAdmin;
+      if (isMounted) {
+        setVerifiedRootAdmin(rootOk);
+      }
+      if (!rootOk) {
         if (isMounted) {
           setStatusMessage({
             type: 'error',
-            text: 'Unauthorized: Administrator privileges required to manage website configuration.',
+            text: 'Unauthorized: Verified Root Administrator privileges required to manage website configuration.',
           });
           setIsLoading(false);
         }
@@ -146,6 +164,50 @@ export const SuperAdminWebsiteEditor: React.FC<SuperAdminWebsiteEditorProps> = (
     };
   }, [tenant.tenantId]);
 
+  useEffect(() => {
+    setActiveSlug(tenant.slug || '');
+  }, [tenant.slug]);
+
+  const handleSaveSlug = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isSavingSlug) return;
+    setSlugError(null);
+
+    const validation = validateAndNormalizeSlug(slugDraftInput);
+    if (!validation.isValid) {
+      setSlugError(validation.error || 'Invalid URL slug.');
+      return;
+    }
+
+    setIsSavingSlug(true);
+    try {
+      const rootOk = await verifyRootAdminStatus(auth.currentUser);
+      if (!rootOk) {
+        setSlugError('Action rejected: Only verified Root Admin can update public URL slugs.');
+        setIsSavingSlug(false);
+        return;
+      }
+
+      const res = await updateTenantSlugAtomic(tenant.tenantId, validation.normalizedSlug);
+      if (!res.success) {
+        setSlugError(res.error || 'Failed to update public URL slug.');
+        setIsSavingSlug(false);
+        return;
+      }
+      setActiveSlug(validation.normalizedSlug);
+      setIsSlugModalOpen(false);
+      setStatusMessage({
+        type: 'success',
+        text: `Public URL "/${validation.normalizedSlug}" saved and mapped to "${tenant.tenantId}".`,
+      });
+      if (onSaved) onSaved(tenant.tenantId);
+    } catch (err: any) {
+      setSlugError(err?.message || 'Unexpected error while saving public URL slug.');
+    } finally {
+      setIsSavingSlug(false);
+    }
+  };
+
   // Track in-memory modifications
   const handleConfigChange = (newConfig: ClientConfig) => {
     setConfig(newConfig);
@@ -169,8 +231,8 @@ export const SuperAdminWebsiteEditor: React.FC<SuperAdminWebsiteEditorProps> = (
     setIsSaving(true);
     setStatusMessage(null);
 
-    const isAdmin = await verifyServerAdminStatus(auth.currentUser);
-    if (!isAdmin) {
+    const rootOk = await verifyRootAdminStatus(auth.currentUser);
+    if (!rootOk) {
       setStatusMessage({
         type: 'error',
         text: 'Save rejected: Only verified Root Admin can modify website configurations.',
@@ -213,8 +275,8 @@ export const SuperAdminWebsiteEditor: React.FC<SuperAdminWebsiteEditorProps> = (
     setStatusMessage(null);
     setConfirmDialog(null);
 
-    const isAdmin = await verifyServerAdminStatus(auth.currentUser);
-    if (!isAdmin) {
+    const rootOk = await verifyRootAdminStatus(auth.currentUser);
+    if (!rootOk) {
       setStatusMessage({
         type: 'error',
         text: 'Action rejected: Only verified Root Admin can publish websites.',
@@ -279,8 +341,8 @@ export const SuperAdminWebsiteEditor: React.FC<SuperAdminWebsiteEditorProps> = (
     setStatusMessage(null);
     setConfirmDialog(null);
 
-    const isAdmin = await verifyServerAdminStatus(auth.currentUser);
-    if (!isAdmin) {
+    const rootOk = await verifyRootAdminStatus(auth.currentUser);
+    if (!rootOk) {
       setStatusMessage({
         type: 'error',
         text: 'Action rejected: Only verified Root Admin can unpublish websites.',
@@ -364,6 +426,27 @@ export const SuperAdminWebsiteEditor: React.FC<SuperAdminWebsiteEditorProps> = (
                   <AlertTriangle className="w-3 h-3" />
                   TENANT SUSPENDED
                 </span>
+              )}
+
+              {/* Public URL Slug Action Badge (Root Admin Only) */}
+              {verifiedRootAdmin && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSlugDraftInput((activeSlug || tenant.tenantId || '').replace(/_/g, '-'));
+                    setSlugError(null);
+                    setIsSlugModalOpen(true);
+                  }}
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold border transition cursor-pointer ${
+                    activeSlug
+                      ? 'bg-sky-500/10 text-sky-300 border-sky-500/30 hover:bg-sky-500/20'
+                      : 'bg-amber-500/10 text-amber-300 border-amber-500/30 hover:bg-amber-500/20'
+                  }`}
+                  title="Set or update the public URL path slug in /slugs/{slug}"
+                >
+                  <Link2 className="w-3 h-3" />
+                  <span>{activeSlug ? `URL: /${activeSlug}` : 'Set Public URL'}</span>
+                </button>
               )}
             </div>
             <p className="text-[11px] text-slate-400 mt-0.5">
@@ -677,6 +760,79 @@ export const SuperAdminWebsiteEditor: React.FC<SuperAdminWebsiteEditorProps> = (
                 </span>
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Public URL Slug Modal */}
+      {isSlugModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in">
+          <div className="relative w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 text-slate-100">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-800 mb-4">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-sky-500/10 border border-sky-500/30 text-sky-400">
+                  <Link2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-extrabold text-white">Public Website URL Slug</h3>
+                  <p className="text-xs text-slate-400">{tenant.businessName}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => !isSavingSlug && setIsSlugModalOpen(false)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {slugError && (
+              <div className="mb-4 p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <span>{slugError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleSaveSlug} className="space-y-4 text-xs">
+              <div>
+                <label className="block text-slate-300 font-bold mb-1">URL Path Slug</label>
+                <div className="flex items-center bg-slate-950 border border-slate-700 focus-within:border-sky-500 rounded-xl overflow-hidden">
+                  <span className="px-3 py-2.5 text-slate-500 bg-slate-900 border-r border-slate-800 font-mono">/</span>
+                  <input
+                    type="text"
+                    required
+                    value={slugDraftInput}
+                    onChange={(e) => setSlugDraftInput(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-'))}
+                    placeholder="e.g. demo-tarot-kochi"
+                    className="w-full bg-transparent px-3 py-2.5 text-white font-mono placeholder-slate-500 focus:outline-none"
+                    disabled={isSavingSlug}
+                  />
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1.5">
+                  Maps <span className="font-mono text-sky-300">/slugs/{slugDraftInput || 'slug'}</span> to <span className="font-mono text-emerald-400">{tenant.tenantId}</span>.
+                </p>
+              </div>
+
+              <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setIsSlugModalOpen(false)}
+                  disabled={isSavingSlug}
+                  className="px-4 py-2 rounded-xl text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 font-bold text-xs transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingSlug}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white font-bold text-xs transition shadow-md cursor-pointer"
+                >
+                  {isSavingSlug && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                  <span>{isSavingSlug ? 'Saving URL...' : 'Save Public URL'}</span>
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
