@@ -196,6 +196,7 @@ export const REGISTERED_HOSTNAME_MAP: Record<string, string> = {
   'tarot.leadpilot.pages.dev': 'demo-tarot-kochi',
   'apex.leadpilot.pages.dev': 'client-apex-hvac',
   'roofing.leadpilot.pages.dev': 'roofing-client-01',
+  'leadpilot-staging.pages.dev': 'roofing-client-01',
 };
 
 export function resolveCurrentTenantId(hostname?: string, isProdOverride?: boolean): { tenantId: string; isValid: boolean } {

@@ -280,15 +280,19 @@ describe('Phase 3B: Dynamic Public Tenant Routing Suite', () => {
   // SECTION 4: CLOUDFLARE STAGING HOSTNAME & NULL-SAFE SLUG RULES GUARD
   // =========================================================================
   describe('Section 4: Staging Hostname Isolation & Rules Integrity', () => {
-    it('1. Shared .pages.dev staging/preview hostnames never accept single-tenant env override in production', () => {
+    it('1. Registered staging hostname resolves strictly to roofing-client-01 while unmapped .pages.dev preview/staging hostnames fail closed against single-tenant env override', () => {
       process.env.VITE_SINGLE_TENANT_MODE = 'true';
       process.env.VITE_CLIENT_ID = 'client-apex-hvac';
 
       expect(resolveCurrentTenantId('leadpilot-staging.pages.dev', true)).toEqual({
+        tenantId: 'roofing-client-01',
+        isValid: true,
+      });
+      expect(resolveCurrentTenantId('abc123.leadpilot-staging.pages.dev', true)).toEqual({
         tenantId: '',
         isValid: false,
       });
-      expect(resolveCurrentTenantId('abc123.leadpilot-staging.pages.dev', true)).toEqual({
+      expect(resolveCurrentTenantId('unregistered-staging.pages.dev', true)).toEqual({
         tenantId: '',
         isValid: false,
       });

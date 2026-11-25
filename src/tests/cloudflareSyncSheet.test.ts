@@ -686,6 +686,11 @@ describe('Cloudflare Pages Functions: Critical Security Gateway Test Suite', () 
     expect(roofing.isValid).toBe(true);
     expect(roofing.tenantId).toBe('roofing-client-01');
     expect(roofing.config?.clientId).toBe('roofing-client-01');
+
+    const stagingRoofing = getAuthoritativeTenantConfig('leadpilot-staging.pages.dev', true);
+    expect(stagingRoofing.isValid).toBe(true);
+    expect(stagingRoofing.tenantId).toBe('roofing-client-01');
+    expect(stagingRoofing.config?.clientId).toBe('roofing-client-01');
   });
 
   it('32. Standalone Tenant Isolation: Registered hostname cannot be overridden by adversarial query parameters', () => {
@@ -818,3 +823,5 @@ describe('Cloudflare Pages Functions: Critical Security Gateway Test Suite', () 
     }
   });
 });
+
+
