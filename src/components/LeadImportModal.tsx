@@ -1,7 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import { ClientConfig, LeadItem, LeadStatus, LeadNote } from '../types';
-import { saveAllLeads, getStoredLeads, generateLeadId, syncLeadActionToRemote, saveLead } from '../utils/leadStorage';
+import { doc, setDoc } from 'firebase/firestore';
+import { auth, db } from '../firebase';
+import { saveAllLeads, getStoredLeads, generateLeadId, syncLeadActionToRemote, cleanForFirestore } from '../utils/leadStorage';
 import {
   SUPPORTED_COUNTRY_CODES,
   detectDefaultCountryCode,
@@ -357,7 +359,12 @@ export const LeadImportModal: React.FC<LeadImportModalProps> = ({
     setIsProcessing(true);
 
     // Scoped strictly to the active client / tenant
-    const targetTenant = currentConfig.clientId || 'prodrain-plumbing-kochi';
+    const targetTenant = (currentConfig.clientId || '').trim().toLowerCase();
+    if (!targetTenant) {
+      setFileError('Target business tenant is not configured. Please select a valid client before importing.');
+      setIsProcessing(false);
+      return;
+    }
     const existingLeads = getStoredLeads(targetTenant);
 
     const existingIds = new Map(existingLeads.map((l) => [l.id.trim().toLowerCase(), l]));
@@ -513,7 +520,12 @@ export const LeadImportModal: React.FC<LeadImportModalProps> = ({
   const handleExecuteImport = async () => {
     setIsProcessing(true);
 
-    const targetTenant = currentConfig.clientId || 'prodrain-plumbing-kochi';
+    const targetTenant = (currentConfig.clientId || '').trim().toLowerCase();
+    if (!targetTenant) {
+      setFileError('Target business tenant is not configured. Import aborted.');
+      setIsProcessing(false);
+      return;
+    }
     const existingLeads = getStoredLeads(targetTenant);
     const initialExistingCount = existingLeads.length;
     const endpoint = currentConfig.formEndpoint ? currentConfig.formEndpoint.trim() : '';
@@ -603,7 +615,7 @@ export const LeadImportModal: React.FC<LeadImportModalProps> = ({
           id: newLeadId,
           timestamp: row.timestamp || nowIso,
           clientId: targetTenant,
-          businessName: currentConfig.businessName || 'ProDrain Plumbing',
+          businessName: currentConfig.businessName || targetTenant,
           name: row.name || 'Unnamed Contact',
           phone: normalizedPhone || row.phone || '0000000000',
           email: row.email || undefined,
@@ -627,23 +639,39 @@ export const LeadImportModal: React.FC<LeadImportModalProps> = ({
       saveAllLeads(mergedLeads, targetTenant);
 
       // Persist new and updated leads to Firestore
-      for (const lead of leadsToPersist) {
-        try {
-          await saveLead(lead);
-        } catch (err) {
-          console.warn('Failed to persist imported lead to Firestore:', err);
+      let firestoreFailedCount = 0;
+      if (auth.currentUser) {
+        for (const lead of leadsToPersist) {
+          try {
+            const leadRef = doc(db, 'tenants', targetTenant, 'leads', lead.id);
+            await setDoc(leadRef, cleanForFirestore(lead), { merge: true });
+          } catch (err) {
+            firestoreFailedCount++;
+            console.warn('Failed to persist imported lead to Firestore:', err);
+          }
         }
       }
 
-      // Sync imported and updated leads to remote Google Sheet if endpoint configured
+      // Sync genuinely new leads (avoid duplicate createLead rows for updated existing records)
+      let sheetFailedCount = 0;
       if (endpoint && endpoint.startsWith('http')) {
+        const existingIdSet = new Set(existingLeads.map((l) => l.id.trim().toLowerCase()));
         for (const lead of leadsToPersist) {
+          if (existingIdSet.has(lead.id.trim().toLowerCase())) {
+            continue;
+          }
           try {
-            await syncLeadActionToRemote(endpoint, { action: 'createLead', ...lead });
+            const syncRes = await syncLeadActionToRemote(endpoint, { action: 'createLead', ...lead });
+            if (!syncRes.success) sheetFailedCount++;
           } catch (err) {
+            sheetFailedCount++;
             console.warn('Failed to sync imported lead to Google Apps Script:', err);
           }
         }
+      }
+
+      if (auth.currentUser && leadsToPersist.length > 0 && firestoreFailedCount >= leadsToPersist.length) {
+        throw new Error('Could not save imported leads to Firestore database (permission or connection error).');
       }
 
       const summary: ImportResultSummary = {
@@ -659,7 +687,11 @@ export const LeadImportModal: React.FC<LeadImportModalProps> = ({
       setIsProcessing(false);
       setStep(4);
 
-      const toastMsg = `Import complete: ${newLeadsAdded} added, ${existingLeadsUpdated} updated, ${duplicateRowsSkipped} duplicates skipped. ${initialExistingCount} existing leads preserved.`;
+      const syncWarningParts: string[] = [];
+      if (firestoreFailedCount > 0) syncWarningParts.push(`${firestoreFailedCount} Firestore write(s) failed`);
+      if (sheetFailedCount > 0) syncWarningParts.push(`${sheetFailedCount} Google Sheet sync(s) failed`);
+      const warningSuffix = syncWarningParts.length > 0 ? ` (${syncWarningParts.join(', ')})` : '';
+      const toastMsg = `Import complete: ${newLeadsAdded} added, ${existingLeadsUpdated} updated, ${duplicateRowsSkipped} duplicates skipped. ${initialExistingCount} existing leads preserved.${warningSuffix}`;
       onImportSuccess(newLeadsAdded + existingLeadsUpdated, toastMsg);
     } catch (importErr: any) {
       console.error('Import execution error:', importErr);
@@ -675,7 +707,7 @@ export const LeadImportModal: React.FC<LeadImportModalProps> = ({
   const invalidRowsCount = parsedRows.filter((r) => r.validationStatus === 'error').length;
   const newRowsCount = parsedRows.filter((r) => !r.isUpdate && r.validationStatus !== 'error' && (!r.isDuplicate || !skipDuplicates)).length;
   const validRowsCount = newRowsCount + updateRowsCount;
-  const preservedLeadsCount = getStoredLeads(currentConfig.clientId || 'prodrain-plumbing-kochi').length;
+  const preservedLeadsCount = getStoredLeads((currentConfig.clientId || '').trim().toLowerCase()).length;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm overflow-y-auto">

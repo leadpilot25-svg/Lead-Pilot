@@ -210,6 +210,18 @@ export function getInitialDemoLeads(clientId?: string): LeadItem[] {
   return [];
 }
 
+function shouldSeedDemoLeads(): boolean {
+  const isProd = Boolean((import.meta as any).env?.PROD);
+  const appTarget = ((import.meta as any).env?.VITE_APP_TARGET || '').trim().toLowerCase();
+  if (isProd || appTarget === 'crm' || appTarget === 'landing' || appTarget === 'client') {
+    return false;
+  }
+  if (auth.currentUser) {
+    return false;
+  }
+  return true;
+}
+
 /**
  * Get stored leads from local client cache
  */
@@ -219,11 +231,12 @@ export function getStoredLeads(clientId?: string): LeadItem[] {
     const scopedKey = getClientStorageKey(clientId);
     const raw = localStorage.getItem(scopedKey);
     if (raw === null) {
-      // First-time visit: seed sample demo leads for this tenant
-      const initialLeads = getInitialDemoLeads(clientId);
-      if (initialLeads.length > 0) {
-        localStorage.setItem(scopedKey, JSON.stringify(initialLeads));
-        return initialLeads;
+      if (shouldSeedDemoLeads()) {
+        const initialLeads = getInitialDemoLeads(clientId);
+        if (initialLeads.length > 0) {
+          localStorage.setItem(scopedKey, JSON.stringify(initialLeads));
+          return initialLeads;
+        }
       }
       return [];
     }
@@ -426,13 +439,23 @@ export async function saveLead(
       pageUrl: input.pageUrl || existing.pageUrl,
     };
     leads[existingIndex] = targetLead;
+
+    // Anonymous public visitors cannot overwrite existing Firestore documents (allow update requires CRM membership).
+    if (!auth.currentUser && !options?.persistLeadToFirestore) {
+      saveAllLeads(leads, targetTenant);
+      return {
+        success: true,
+        message: 'Enquiry already received — our team has your request.',
+        lead: targetLead,
+      };
+    }
   } else {
     const newLeadId = input.id || generateLeadId(leads.length);
     targetLead = {
       id: newLeadId,
       timestamp: input.timestamp || nowIso,
       clientId: targetTenant,
-      businessName: input.businessName || TENANT_METADATA_MAP[targetTenant]?.businessName || 'ProDrain Plumbing',
+      businessName: input.businessName || TENANT_METADATA_MAP[targetTenant]?.businessName || targetTenant,
       name: input.name.trim(),
       phone: input.phone.trim(),
       email: input.email ? input.email.trim() : undefined,
@@ -460,8 +483,6 @@ export async function saveLead(
   try {
     // Decouple public landing submissions from CRM internal audit fields:
     // If submission is unauthenticated (anonymous public visitor), write ONLY the approved 13 public fields.
-    // Internal CRM fields (notes, contactCount, contactLogs) are excluded from the public Firestore write
-    // so rules strictly reject unauthorized fields while keeping Google Sheets sync completely intact.
     const firestorePayload = auth.currentUser
       ? cleanForFirestore(targetLead)
       : cleanForFirestore({
@@ -532,6 +553,13 @@ export async function saveLead(
   return { success: true, message: `Lead saved to CRM${syncMessage}.`, lead: targetLead };
 }
 
+function canSyncRemoteAction(endpointUrl?: string): boolean {
+  return Boolean(
+    (endpointUrl && endpointUrl.trim().startsWith('http')) ||
+      (isCloudflareGatewayMode() && auth.currentUser)
+  );
+}
+
 /**
  * Update lead status in Firestore & local cache
  */
@@ -540,10 +568,15 @@ export async function updateLeadStatus(
   status: LeadStatus,
   tenantId?: string,
   endpointUrl?: string
-): Promise<{ success: boolean; message: string; lead: LeadItem | null }> {
-  const cleanTenant = (tenantId || 'demo-tarot-kochi').trim().toLowerCase();
+): Promise<{ success: boolean; message: string; lead: LeadItem | null; sheetSynced?: boolean }> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  if (!cleanTenant) {
+    return { success: false, message: 'Tenant ID is required.', lead: null, sheetSynced: false };
+  }
+
   const leads = getStoredLeads(cleanTenant);
   const idx = leads.findIndex((l) => l.id === leadId);
+  const previousLead = idx !== -1 ? { ...leads[idx] } : null;
 
   const autoNote: LeadNote = {
     id: `note-${Date.now()}`,
@@ -554,38 +587,60 @@ export async function updateLeadStatus(
 
   let updatedLead: LeadItem | null = null;
   if (idx !== -1) {
-    leads[idx].status = status;
-    leads[idx].notes = [autoNote, ...(leads[idx].notes || [])];
-    updatedLead = leads[idx];
+    updatedLead = {
+      ...leads[idx],
+      status,
+      notes: [autoNote, ...(leads[idx].notes || [])],
+    };
+    leads[idx] = updatedLead;
     saveAllLeads(leads, cleanTenant);
   }
 
   // Persist to Firestore
-  try {
-    const leadRef = doc(db, 'tenants', cleanTenant, 'leads', leadId);
-    await updateDoc(leadRef, {
-      status,
-      notes: updatedLead?.notes || [autoNote],
-    });
-  } catch (err) {
-    console.warn('Firestore updateLeadStatus notice:', err);
+  if (auth.currentUser) {
+    try {
+      const leadRef = doc(db, 'tenants', cleanTenant, 'leads', leadId);
+      await updateDoc(leadRef, {
+        status,
+        notes: updatedLead?.notes || [autoNote],
+      });
+    } catch (err: any) {
+      if (idx !== -1 && previousLead) {
+        leads[idx] = previousLead;
+        saveAllLeads(leads, cleanTenant);
+      }
+      return {
+        success: false,
+        message: err?.message || 'Failed to update lead status in Firestore.',
+        lead: null,
+        sheetSynced: false,
+      };
+    }
   }
 
-  // Optional Google Sheet webhook sync
-  if (endpointUrl && endpointUrl.startsWith('http')) {
+  let sheetSynced = false;
+  let sheetNotice = '';
+  if (canSyncRemoteAction(endpointUrl)) {
     try {
-      await syncLeadActionToRemote(endpointUrl, {
+      const syncRes = await syncLeadActionToRemote(endpointUrl, {
         action: 'updateStatus',
         leadId,
         clientId: cleanTenant,
         status,
       });
-    } catch {
-      // Non-blocking
+      sheetSynced = syncRes.success;
+      if (!syncRes.success) sheetNotice = ` (Sheet sync pending: ${syncRes.message})`;
+    } catch (e: any) {
+      sheetNotice = ` (Sheet sync notice: ${e?.message || 'Network error'})`;
     }
   }
 
-  return { success: true, message: `Status updated to ${status}`, lead: updatedLead };
+  return {
+    success: true,
+    message: `Status updated to "${status}"${sheetNotice}`,
+    lead: updatedLead,
+    sheetSynced,
+  };
 }
 
 /**
@@ -597,10 +652,15 @@ export async function addLeadNote(
   author = 'Agent',
   tenantId?: string,
   endpointUrl?: string
-): Promise<{ success: boolean; message: string; lead: LeadItem | null }> {
-  const cleanTenant = (tenantId || 'demo-tarot-kochi').trim().toLowerCase();
+): Promise<{ success: boolean; message: string; lead: LeadItem | null; sheetSynced?: boolean }> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  if (!cleanTenant) {
+    return { success: false, message: 'Tenant ID is required.', lead: null, sheetSynced: false };
+  }
+
   const leads = getStoredLeads(cleanTenant);
   const idx = leads.findIndex((l) => l.id === leadId);
+  const previousLead = idx !== -1 ? { ...leads[idx] } : null;
 
   const newNote: LeadNote = {
     id: `note-${Date.now()}`,
@@ -611,36 +671,58 @@ export async function addLeadNote(
 
   let updatedLead: LeadItem | null = null;
   if (idx !== -1) {
-    leads[idx].notes = [newNote, ...(leads[idx].notes || [])];
-    updatedLead = leads[idx];
+    updatedLead = {
+      ...leads[idx],
+      notes: [newNote, ...(leads[idx].notes || [])],
+    };
+    leads[idx] = updatedLead;
     saveAllLeads(leads, cleanTenant);
   }
 
-  // Persist to Firestore
-  try {
-    const leadRef = doc(db, 'tenants', cleanTenant, 'leads', leadId);
-    await updateDoc(leadRef, {
-      notes: updatedLead?.notes || [newNote],
-    });
-  } catch (err) {
-    console.warn('Firestore addLeadNote notice:', err);
+  if (auth.currentUser) {
+    try {
+      const leadRef = doc(db, 'tenants', cleanTenant, 'leads', leadId);
+      await updateDoc(leadRef, {
+        notes: updatedLead?.notes || [newNote],
+      });
+    } catch (err: any) {
+      if (idx !== -1 && previousLead) {
+        leads[idx] = previousLead;
+        saveAllLeads(leads, cleanTenant);
+      }
+      return {
+        success: false,
+        message: err?.message || 'Failed to save note to Firestore.',
+        lead: null,
+        sheetSynced: false,
+      };
+    }
   }
 
-  if (endpointUrl && endpointUrl.startsWith('http')) {
+  let sheetSynced = false;
+  let sheetNotice = '';
+  if (canSyncRemoteAction(endpointUrl)) {
     try {
-      await syncLeadActionToRemote(endpointUrl, {
+      const syncRes = await syncLeadActionToRemote(endpointUrl, {
         action: 'addNote',
         leadId,
         clientId: cleanTenant,
         text: text.trim(),
         author,
       });
-    } catch {
-      // Non-blocking
+      sheetSynced = syncRes.success;
+      if (!syncRes.success) sheetNotice = ` (Sheet sync pending: ${syncRes.message})`;
+    } catch (e: any) {
+      sheetNotice = ` (Sheet sync notice: ${e?.message || 'Network error'})`;
     }
   }
 
-  return { success: true, message: 'Note added successfully', lead: updatedLead };
+  return {
+    success: true,
+    message: `Note added${sheetNotice}`,
+    lead: updatedLead,
+    sheetSynced,
+  };
 }
 
 /**
@@ -651,10 +733,15 @@ export async function scheduleLeadFollowUp(
   followUpDate: string,
   tenantId?: string,
   endpointUrl?: string
-): Promise<{ success: boolean; message: string; lead: LeadItem | null }> {
-  const cleanTenant = (tenantId || 'demo-tarot-kochi').trim().toLowerCase();
+): Promise<{ success: boolean; message: string; lead: LeadItem | null; sheetSynced?: boolean }> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  if (!cleanTenant) {
+    return { success: false, message: 'Tenant ID is required.', lead: null, sheetSynced: false };
+  }
+
   const leads = getStoredLeads(cleanTenant);
   const idx = leads.findIndex((l) => l.id === leadId);
+  const previousLead = idx !== -1 ? { ...leads[idx] } : null;
 
   const autoNote: LeadNote = {
     id: `note-${Date.now()}`,
@@ -665,41 +752,131 @@ export async function scheduleLeadFollowUp(
 
   let updatedLead: LeadItem | null = null;
   if (idx !== -1) {
-    leads[idx].followUpDate = followUpDate;
-    if (leads[idx].status === 'New') {
-      leads[idx].status = 'Follow-up';
-    }
-    leads[idx].notes = [autoNote, ...(leads[idx].notes || [])];
-    updatedLead = leads[idx];
+    updatedLead = {
+      ...leads[idx],
+      followUpDate,
+      status: leads[idx].status === 'New' && followUpDate ? 'Follow-up' : leads[idx].status,
+      notes: [autoNote, ...(leads[idx].notes || [])],
+    };
+    leads[idx] = updatedLead;
     saveAllLeads(leads, cleanTenant);
   }
 
-  try {
-    const leadRef = doc(db, 'tenants', cleanTenant, 'leads', leadId);
-    await updateDoc(leadRef, {
-      followUpDate,
-      status: updatedLead?.status || 'Follow-up',
-      notes: updatedLead?.notes || [autoNote],
-    });
-  } catch (err) {
-    console.warn('Firestore scheduleLeadFollowUp notice:', err);
+  if (auth.currentUser) {
+    try {
+      const leadRef = doc(db, 'tenants', cleanTenant, 'leads', leadId);
+      await updateDoc(leadRef, {
+        followUpDate,
+        status: updatedLead?.status || 'Follow-up',
+        notes: updatedLead?.notes || [autoNote],
+      });
+    } catch (err: any) {
+      if (idx !== -1 && previousLead) {
+        leads[idx] = previousLead;
+        saveAllLeads(leads, cleanTenant);
+      }
+      return {
+        success: false,
+        message: err?.message || 'Failed to save follow-up schedule to Firestore.',
+        lead: null,
+        sheetSynced: false,
+      };
+    }
   }
 
-  if (endpointUrl && endpointUrl.startsWith('http')) {
+  let sheetSynced = false;
+  let sheetNotice = '';
+  if (canSyncRemoteAction(endpointUrl)) {
     try {
-      await syncLeadActionToRemote(endpointUrl, {
+      const syncRes = await syncLeadActionToRemote(endpointUrl, {
         action: 'scheduleFollowUp',
         leadId,
         clientId: cleanTenant,
         followUpDate,
-        status: 'Follow-up',
+        status: updatedLead?.status || 'Follow-up',
       });
-    } catch {
-      // Non-blocking
+      sheetSynced = syncRes.success;
+      if (!syncRes.success) sheetNotice = ` (Sheet sync pending: ${syncRes.message})`;
+    } catch (e: any) {
+      sheetNotice = ` (Sheet sync notice: ${e?.message || 'Network error'})`;
     }
   }
 
-  return { success: true, message: 'Follow-up scheduled successfully', lead: updatedLead };
+  return {
+    success: true,
+    message: `${followUpDate ? 'Follow-up scheduled' : 'Follow-up cleared'}${sheetNotice}`,
+    lead: updatedLead,
+    sheetSynced,
+  };
+}
+
+/**
+ * Update a lead's phone number in Firestore, local cache, and Google Sheets
+ */
+export async function updateLeadPhone(
+  leadId: string,
+  phone: string,
+  tenantId?: string,
+  endpointUrl?: string
+): Promise<{ success: boolean; message: string; lead: LeadItem | null; sheetSynced?: boolean }> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  const cleanPhone = (phone || '').trim();
+  if (!cleanTenant || !cleanPhone) {
+    return { success: false, message: 'Tenant ID and phone number are required.', lead: null, sheetSynced: false };
+  }
+
+  const leads = getStoredLeads(cleanTenant);
+  const idx = leads.findIndex((l) => l.id === leadId);
+  const previousLead = idx !== -1 ? { ...leads[idx] } : null;
+
+  let updatedLead: LeadItem | null = null;
+  if (idx !== -1) {
+    updatedLead = { ...leads[idx], phone: cleanPhone };
+    leads[idx] = updatedLead;
+    saveAllLeads(leads, cleanTenant);
+  }
+
+  if (auth.currentUser) {
+    try {
+      const leadRef = doc(db, 'tenants', cleanTenant, 'leads', leadId);
+      await updateDoc(leadRef, { phone: cleanPhone });
+    } catch (err: any) {
+      if (idx !== -1 && previousLead) {
+        leads[idx] = previousLead;
+        saveAllLeads(leads, cleanTenant);
+      }
+      return {
+        success: false,
+        message: err?.message || 'Failed to update phone number in Firestore.',
+        lead: null,
+        sheetSynced: false,
+      };
+    }
+  }
+
+  let sheetSynced = false;
+  let sheetNotice = '';
+  if (canSyncRemoteAction(endpointUrl)) {
+    try {
+      const syncRes = await syncLeadActionToRemote(endpointUrl, {
+        action: 'updatePhone',
+        leadId,
+        clientId: cleanTenant,
+        phone: cleanPhone,
+      });
+      sheetSynced = syncRes.success;
+      if (!syncRes.success) sheetNotice = ` (Sheet sync pending: ${syncRes.message})`;
+    } catch (e: any) {
+      sheetNotice = ` (Sheet sync notice: ${e?.message || 'Network error'})`;
+    }
+  }
+
+  return {
+    success: true,
+    message: `Phone updated to ${cleanPhone}${sheetNotice}`,
+    lead: updatedLead,
+    sheetSynced,
+  };
 }
 
 /**
@@ -711,10 +888,15 @@ export async function logLeadContact(
   customNote?: string,
   tenantId?: string,
   endpointUrl?: string
-): Promise<{ success: boolean; message: string; lead: LeadItem | null }> {
-  const cleanTenant = (tenantId || 'demo-tarot-kochi').trim().toLowerCase();
+): Promise<{ success: boolean; message: string; lead: LeadItem | null; sheetSynced?: boolean }> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  if (!cleanTenant) {
+    return { success: false, message: 'Tenant ID is required.', lead: null, sheetSynced: false };
+  }
+
   const leads = getStoredLeads(cleanTenant);
   const idx = leads.findIndex((l) => l.id === leadId);
+  const previousLead = idx !== -1 ? { ...leads[idx] } : null;
 
   const nowIso = new Date().toISOString();
   const logEntry: LeadContactLog = {
@@ -733,47 +915,68 @@ export async function logLeadContact(
 
   let updatedLead: LeadItem | null = null;
   if (idx !== -1) {
-    leads[idx].lastContacted = nowIso;
-    leads[idx].lastContactMethod = method;
-    leads[idx].contactCount = (leads[idx].contactCount || 0) + 1;
-    if (leads[idx].status === 'New') {
-      leads[idx].status = 'Contacted';
-    }
-    leads[idx].contactLogs = [logEntry, ...(leads[idx].contactLogs || [])];
-    leads[idx].notes = [autoNote, ...(leads[idx].notes || [])];
-    updatedLead = leads[idx];
+    updatedLead = {
+      ...leads[idx],
+      lastContacted: nowIso,
+      lastContactMethod: method,
+      contactCount: (leads[idx].contactCount || 0) + 1,
+      status: leads[idx].status === 'New' ? 'Contacted' : leads[idx].status,
+      contactLogs: [logEntry, ...(leads[idx].contactLogs || [])],
+      notes: [autoNote, ...(leads[idx].notes || [])],
+    };
+    leads[idx] = updatedLead;
     saveAllLeads(leads, cleanTenant);
   }
 
-  try {
-    const leadRef = doc(db, 'tenants', cleanTenant, 'leads', leadId);
-    await updateDoc(leadRef, {
-      lastContacted: nowIso,
-      lastContactMethod: method,
-      contactCount: updatedLead?.contactCount || 1,
-      status: updatedLead?.status || 'Contacted',
-      contactLogs: updatedLead?.contactLogs || [logEntry],
-      notes: updatedLead?.notes || [autoNote],
-    });
-  } catch (err) {
-    console.warn('Firestore logLeadContact notice:', err);
+  if (auth.currentUser) {
+    try {
+      const leadRef = doc(db, 'tenants', cleanTenant, 'leads', leadId);
+      await updateDoc(leadRef, {
+        lastContacted: nowIso,
+        lastContactMethod: method,
+        contactCount: updatedLead?.contactCount || 1,
+        status: updatedLead?.status || 'Contacted',
+        contactLogs: updatedLead?.contactLogs || [logEntry],
+        notes: updatedLead?.notes || [autoNote],
+      });
+    } catch (err: any) {
+      if (idx !== -1 && previousLead) {
+        leads[idx] = previousLead;
+        saveAllLeads(leads, cleanTenant);
+      }
+      return {
+        success: false,
+        message: err?.message || 'Failed to log contact in Firestore.',
+        lead: null,
+        sheetSynced: false,
+      };
+    }
   }
 
-  if (endpointUrl && endpointUrl.startsWith('http')) {
+  let sheetSynced = false;
+  let sheetNotice = '';
+  if (canSyncRemoteAction(endpointUrl)) {
     try {
-      await syncLeadActionToRemote(endpointUrl, {
+      const syncRes = await syncLeadActionToRemote(endpointUrl, {
         action: 'logContact',
         leadId,
         clientId: cleanTenant,
         method,
         customNote,
       });
-    } catch {
-      // Non-blocking
+      sheetSynced = syncRes.success;
+      if (!syncRes.success) sheetNotice = ` (Sheet sync pending: ${syncRes.message})`;
+    } catch (e: any) {
+      sheetNotice = ` (Sheet sync notice: ${e?.message || 'Network error'})`;
     }
   }
 
-  return { success: true, message: `Logged ${method} contact`, lead: updatedLead };
+  return {
+    success: true,
+    message: `Logged ${method} contact${sheetNotice}`,
+    lead: updatedLead,
+    sheetSynced,
+  };
 }
 
 /**
@@ -784,7 +987,10 @@ export async function deleteLead(
   tenantId: string,
   endpointUrl?: string
 ): Promise<{ success: boolean; message: string }> {
-  const cleanTenant = (tenantId || 'demo-tarot-kochi').trim().toLowerCase();
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  if (!cleanTenant) {
+    return { success: false, message: 'Tenant ID is required to delete a lead.' };
+  }
   const leads = getStoredLeads(cleanTenant);
   const targetLead = leads.find((l) => l.id === leadId);
 
@@ -1304,17 +1510,62 @@ export async function fetchRemoteSheetLeads(
   }
 }
 
+const inFlightSheetSyncs = new Map<string, Promise<SheetSyncSummary>>();
+
+const STATUS_PROGRESSION_RANK: Record<LeadStatus, number> = {
+  New: 0,
+  Contacted: 1,
+  'Follow-up': 2,
+  Qualified: 3,
+  Won: 4,
+  Lost: 4,
+};
+
 /**
  * Full Bidirectional Synchronization: Google Sheets -> LeadPilot CRM
- * Ingests, updates, and deduplicates spreadsheet rows into Firestore and local CRM cache.
+ * Serializes concurrent syncs per tenant and applies conflict resolution rules.
  */
 export async function syncGoogleSheetToCrm(
   endpointUrl: string,
   tenantId: string,
   options?: { apiKey?: string; conflictStrategy?: 'sheetWins' | 'crmWins' }
 ): Promise<SheetSyncSummary> {
-  const cleanTenant = (tenantId || 'prodrain-plumbing-kochi').trim().toLowerCase();
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
   const nowStr = new Date().toLocaleTimeString();
+
+  if (!cleanTenant) {
+    return {
+      success: false,
+      message: 'Tenant ID is required for Google Sheets synchronization.',
+      newLeadsImported: 0,
+      existingLeadsUpdated: 0,
+      duplicatesSkipped: 0,
+      rowsSkippedDueToValidationError: 0,
+      totalSpreadsheetRows: 0,
+      lastSyncTime: nowStr,
+      error: 'Missing tenantId',
+    };
+  }
+
+  const existingPromise = inFlightSheetSyncs.get(cleanTenant);
+  if (existingPromise) {
+    return existingPromise;
+  }
+
+  const syncPromise = executeSyncGoogleSheetToCrm(endpointUrl, cleanTenant, options).finally(() => {
+    inFlightSheetSyncs.delete(cleanTenant);
+  });
+  inFlightSheetSyncs.set(cleanTenant, syncPromise);
+  return syncPromise;
+}
+
+async function executeSyncGoogleSheetToCrm(
+  endpointUrl: string,
+  cleanTenant: string,
+  options?: { apiKey?: string; conflictStrategy?: 'sheetWins' | 'crmWins' }
+): Promise<SheetSyncSummary> {
+  const nowStr = new Date().toLocaleTimeString();
+  const conflictStrategy = options?.conflictStrategy || 'crmWins';
   const useSecureGateway = isCloudflareGatewayMode();
   const cleanEndpoint = typeof endpointUrl === 'string' ? endpointUrl.trim() : '';
 
@@ -1457,14 +1708,21 @@ export async function syncGoogleSheetToCrm(
       if (row.status && row.status.trim()) {
         const matchedStatus = validStatuses.find((s) => s.toLowerCase() === row.status!.trim().toLowerCase());
         if (matchedStatus && matchedStatus !== existing.status) {
-          updatedItem.status = matchedStatus;
-          hasChanges = true;
+          const shouldApplyStatus =
+            conflictStrategy === 'sheetWins' ||
+            STATUS_PROGRESSION_RANK[matchedStatus] > STATUS_PROGRESSION_RANK[existing.status];
+          if (shouldApplyStatus) {
+            updatedItem.status = matchedStatus;
+            hasChanges = true;
+          }
         }
       }
 
       if (row.followUpDate && row.followUpDate.trim() && row.followUpDate.trim() !== existing.followUpDate) {
-        updatedItem.followUpDate = row.followUpDate.trim();
-        hasChanges = true;
+        if (conflictStrategy === 'sheetWins' || !existing.followUpDate) {
+          updatedItem.followUpDate = row.followUpDate.trim();
+          hasChanges = true;
+        }
       }
 
       // Merge Notes safely without wiping CRM notes

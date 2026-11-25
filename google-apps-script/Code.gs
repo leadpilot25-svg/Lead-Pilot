@@ -451,7 +451,200 @@ function doPost(e) {
       });
     }
 
-    // 5. Input Validation & Sanitization (Strict bounds against abuse)
+    var allData = sheet.getDataRange().getValues();
+    var existingHeaders = allData[0];
+    var targetColMap = getHeaderColumnMap(existingHeaders);
+
+    function findRowByLeadId(targetId) {
+      if (!targetId || targetColMap.id === undefined) return -1;
+      var cleanTarget = targetId.toString().trim().toLowerCase();
+      for (var r = 1; r < allData.length; r++) {
+        var cellId = (allData[r][targetColMap.id] || "").toString().trim().toLowerCase();
+        if (cellId === cleanTarget) {
+          return r + 1;
+        }
+      }
+      return -1;
+    }
+
+    function appendNoteToRow(rowNum, noteObj) {
+      if (targetColMap.notes === undefined) return;
+      var notesRange = sheet.getRange(rowNum, targetColMap.notes + 1);
+      var existingNotesRaw = (notesRange.getValue() || "").toString().trim();
+      var notesList = [];
+      if (existingNotesRaw) {
+        try {
+          var parsedNotes = JSON.parse(existingNotesRaw);
+          if (Array.isArray(parsedNotes)) {
+            notesList = parsedNotes;
+          } else {
+            notesList = [{ id: 'note-legacy', text: existingNotesRaw, createdAt: new Date().toISOString(), author: 'Spreadsheet' }];
+          }
+        } catch (parseErr) {
+          notesList = [{ id: 'note-legacy', text: existingNotesRaw, createdAt: new Date().toISOString(), author: 'Spreadsheet' }];
+        }
+      }
+      notesList.unshift(noteObj);
+      notesRange.setValue(JSON.stringify(notesList.slice(0, 50)));
+    }
+
+    // 4B. Handle Authenticated CRM Mutations (updateStatus, addNote, scheduleFollowUp, logContact, updatePhone, deleteLead)
+    if (action !== "createLead") {
+      var mutationLeadId = (data.leadId || data.id || "").toString().trim();
+      if (!mutationLeadId) {
+        return responseJSON({
+          status: "error",
+          result: "error",
+          message: "Missing Lead ID for CRM update."
+        });
+      }
+
+      var targetRowNum = findRowByLeadId(mutationLeadId);
+      if (targetRowNum === -1) {
+        return responseJSON({
+          status: "error",
+          result: "error",
+          message: "Lead ID not found in Google Sheet: " + mutationLeadId
+        });
+      }
+
+      if (action === "updateStatus") {
+        var allowedStatuses = ["New", "Contacted", "Follow-up", "Qualified", "Won", "Lost"];
+        var requestedStatus = (data.status || "").toString().trim();
+        var validStatusMatch = null;
+        for (var stIdx = 0; stIdx < allowedStatuses.length; stIdx++) {
+          if (allowedStatuses[stIdx].toLowerCase() === requestedStatus.toLowerCase()) {
+            validStatusMatch = allowedStatuses[stIdx];
+            break;
+          }
+        }
+        if (!validStatusMatch) {
+          return responseJSON({ status: "error", result: "error", message: "Invalid lead status value." });
+        }
+        if (targetColMap.status !== undefined) {
+          sheet.getRange(targetRowNum, targetColMap.status + 1).setValue(sanitizeFormulaPrefix(validStatusMatch));
+        }
+        appendNoteToRow(targetRowNum, {
+          id: "note-" + Date.now(),
+          text: sanitizeFormulaPrefix('Status updated to "' + validStatusMatch + '"'),
+          createdAt: new Date().toISOString(),
+          author: sanitizeFormulaPrefix(data.author || "Agent")
+        });
+        return responseJSON({
+          status: "success",
+          result: "success",
+          action: "updateStatus",
+          leadId: mutationLeadId,
+          message: "Status updated in Google Sheet."
+        });
+      }
+
+      if (action === "addNote") {
+        var noteBody = (data.text || data.note || "").toString().trim().slice(0, 1000);
+        if (!noteBody) {
+          return responseJSON({ status: "error", result: "error", message: "Note text is required." });
+        }
+        appendNoteToRow(targetRowNum, {
+          id: "note-" + Date.now(),
+          text: sanitizeFormulaPrefix(noteBody),
+          createdAt: new Date().toISOString(),
+          author: sanitizeFormulaPrefix((data.author || "Agent").toString().trim().slice(0, 80))
+        });
+        return responseJSON({
+          status: "success",
+          result: "success",
+          action: "addNote",
+          leadId: mutationLeadId,
+          message: "Note added in Google Sheet."
+        });
+      }
+
+      if (action === "scheduleFollowUp") {
+        var fuDateVal = (data.followUpDate || "").toString().trim().slice(0, 50);
+        if (targetColMap.followUpDate !== undefined) {
+          sheet.getRange(targetRowNum, targetColMap.followUpDate + 1).setValue(sanitizeFormulaPrefix(fuDateVal));
+        }
+        if (targetColMap.status !== undefined && fuDateVal) {
+          var currentStatusCell = (sheet.getRange(targetRowNum, targetColMap.status + 1).getValue() || "").toString().trim();
+          if (!currentStatusCell || currentStatusCell === "New") {
+            sheet.getRange(targetRowNum, targetColMap.status + 1).setValue("Follow-up");
+          }
+        }
+        appendNoteToRow(targetRowNum, {
+          id: "note-" + Date.now(),
+          text: fuDateVal ? sanitizeFormulaPrefix("Follow-up scheduled for " + fuDateVal) : "Follow-up date cleared",
+          createdAt: new Date().toISOString(),
+          author: "System"
+        });
+        return responseJSON({
+          status: "success",
+          result: "success",
+          action: "scheduleFollowUp",
+          leadId: mutationLeadId,
+          message: "Follow-up updated in Google Sheet."
+        });
+      }
+
+      if (action === "logContact") {
+        var contactMethod = sanitizeFormulaPrefix((data.method || "Call").toString().trim().slice(0, 30));
+        var extraNote = sanitizeFormulaPrefix((data.customNote || "").toString().trim().slice(0, 500));
+        if (targetColMap.status !== undefined) {
+          var prevStatus = (sheet.getRange(targetRowNum, targetColMap.status + 1).getValue() || "").toString().trim();
+          if (!prevStatus || prevStatus === "New") {
+            sheet.getRange(targetRowNum, targetColMap.status + 1).setValue("Contacted");
+          }
+        }
+        appendNoteToRow(targetRowNum, {
+          id: "note-" + Date.now(),
+          text: "Initiated outbound " + contactMethod + " contact." + (extraNote ? (" Note: " + extraNote) : ""),
+          createdAt: new Date().toISOString(),
+          author: "System"
+        });
+        return responseJSON({
+          status: "success",
+          result: "success",
+          action: "logContact",
+          leadId: mutationLeadId,
+          message: "Contact logged in Google Sheet."
+        });
+      }
+
+      if (action === "updatePhone") {
+        var newPhone = sanitizeFormulaPrefix((data.phone || "").toString().trim().slice(0, 50));
+        if (!newPhone || newPhone.replace(/\D/g, '').length < 5) {
+          return responseJSON({ status: "error", result: "error", message: "Valid phone number is required." });
+        }
+        if (targetColMap.phone !== undefined) {
+          sheet.getRange(targetRowNum, targetColMap.phone + 1).setNumberFormat('@').setValue(newPhone);
+        }
+        return responseJSON({
+          status: "success",
+          result: "success",
+          action: "updatePhone",
+          leadId: mutationLeadId,
+          message: "Phone updated in Google Sheet."
+        });
+      }
+
+      if (action === "deleteLead") {
+        sheet.deleteRow(targetRowNum);
+        return responseJSON({
+          status: "success",
+          result: "success",
+          action: "deleteLead",
+          leadId: mutationLeadId,
+          message: "Lead deleted from Google Sheet."
+        });
+      }
+
+      return responseJSON({
+        status: "error",
+        result: "error",
+        message: "Unsupported CRM action: " + action
+      });
+    }
+
+    // 5. Input Validation & Sanitization for createLead (Strict bounds against abuse)
     var rawName = (data.name || "").toString().trim().slice(0, 100);
     var rawPhone = (data.phone || "").toString().trim().slice(0, 50);
     var rawEmail = (data.email || "").toString().trim().slice(0, 120);
@@ -465,9 +658,6 @@ function doPost(e) {
         message: "Invalid submission: A valid contact name or phone number is required."
       });
     }
-
-    var allData = sheet.getDataRange().getValues();
-    var existingHeaders = allData[0];
 
     // Build sanitized fields with Formula Injection Protection
     var leadId = sanitizeFormulaPrefix(data.id || ("LP-" + Utilities.formatDate(new Date(), "GMT", "yyyyMMdd") + "-" + Utilities.getUuid().slice(0, 4)));

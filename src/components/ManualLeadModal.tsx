@@ -60,8 +60,8 @@ export const ManualLeadModal: React.FC<ManualLeadModalProps> = ({
 
   if (!isOpen) return null;
 
-  const targetTenant = (currentConfig.clientId || 'demo-tarot-kochi').trim().toLowerCase();
-  const businessName = currentConfig.businessName || 'Tarot Coaching & Guidance';
+  const targetTenant = (currentConfig.clientId || '').trim().toLowerCase();
+  const businessName = currentConfig.businessName || targetTenant || 'Business Portal';
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -115,15 +115,19 @@ export const ManualLeadModal: React.FC<ManualLeadModalProps> = ({
         contactCount: 0,
       };
 
+      if (!targetTenant) {
+        throw new Error('Target tenant is not configured.');
+      }
+
       const endpoint = currentConfig.formEndpoint?.trim();
       const res = await saveLead(leadPayload, endpoint);
 
-      if (res && res.lead) {
+      if (res && res.success && res.lead) {
         onLeadAdded(res.lead);
         handleReset();
         onClose();
       } else {
-        throw new Error('Failed to record lead in storage.');
+        throw new Error(res?.message || 'Failed to save lead to CRM.');
       }
     } catch (err: any) {
       console.error('Error in manual lead creation:', err);

@@ -141,12 +141,18 @@ export async function getOrProvisionUserProfile(user: FirebaseUser, desiredTenan
       // Existing user: load securely provisioned tenant assignment and role from profile
       const data = snap.data();
       tenantId = data.tenantId || '';
-      role = data.role === 'staff' ? 'client_staff' : 'client_admin';
+      const rawRole = (data.role || '').toString().toLowerCase().trim();
+      role =
+        rawRole === 'owner' || rawRole === 'admin' || rawRole === 'client_admin'
+          ? 'client_admin'
+          : 'client_staff';
       businessName = data.businessName || TENANT_METADATA_MAP[tenantId]?.businessName || businessName;
       // Note: No redundant background writes to /members or /tenants during existing user sessions
     } else {
       // First-time sign-in: write initial baseline profile conforming to zero-trust rules
       // (Non-admin users cannot self-assign privileged roles or arbitrary tenant IDs)
+      tenantId = '';
+      role = 'client_staff';
       const newUserData = {
         uid: user.uid,
         email: user.email || '',

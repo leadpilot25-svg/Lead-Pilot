@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { ClientConfig } from '../types';
+import { ClientConfig, LeadItem } from '../types';
 import { saveLead, getStoredLeads } from '../utils/leadStorage';
 import { resolveTenantFormEndpoint } from '../config/clientConfigResolver';
+import { detectDefaultCountryCode, formatPhoneForWhatsApp } from '../utils/phoneUtils';
 import {
   Phone,
   Clock,
@@ -32,8 +33,39 @@ import {
   X,
   CreditCard,
   Building,
-  CheckSquare
+  CheckSquare,
+  MessageSquare
 } from 'lucide-react';
+
+export function buildOwnerWhatsAppRedirectUrl(
+  config: Partial<ClientConfig>,
+  lead?: Partial<LeadItem> | null
+): string | null {
+  const rawOwnerPhone = (
+    config.whatsAppNumber ||
+    config.phoneRaw ||
+    config.phone ||
+    config.businessPhone ||
+    ''
+  ).trim();
+  if (!rawOwnerPhone) return null;
+
+  const defaultCountry = detectDefaultCountryCode(config as ClientConfig);
+  const digits = formatPhoneForWhatsApp(rawOwnerPhone, defaultCountry);
+  if (!digits || digits.replace(/\D/g, '').length < 7) return null;
+
+  const businessLabel = (config.businessName || 'your team').trim();
+  const lines = [
+    `Hello ${businessLabel}, I just submitted an enquiry on your website.`,
+    lead?.id ? `Reference ID: ${lead.id}` : '',
+    lead?.name ? `Name: ${lead.name}` : '',
+    lead?.phone ? `Phone: ${lead.phone}` : '',
+    lead?.service ? `Service: ${lead.service}` : '',
+    lead?.details ? `Details: ${lead.details}` : '',
+  ].filter(Boolean);
+
+  return `https://wa.me/${digits}?text=${encodeURIComponent(lines.join('\n'))}`;
+}
 
 interface LiveWebsitePreviewProps {
   config: ClientConfig;
@@ -50,6 +82,7 @@ export const LiveWebsitePreview: React.FC<LiveWebsitePreviewProps> = ({ config, 
   const [formSubmitting, setFormSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [submittedPayload, setSubmittedPayload] = useState<any>(null);
+  const [whatsAppRedirectClicked, setWhatsAppRedirectClicked] = useState(false);
 
   const [formData, setFormData] = useState({
     name: '',
@@ -137,17 +170,19 @@ export const LiveWebsitePreview: React.FC<LiveWebsitePreviewProps> = ({ config, 
 
     const cleanEmail = formData.email ? formData.email.trim() : '';
 
-    // Prevent duplicate submissions within short 2-minute window
+    // Prevent duplicate submissions within short 2-minute window while preserving confirmation details
     const stored = getStoredLeads(cleanTenant);
     const twoMinsAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-    const isDup = stored.some(
+    const matchedDuplicate = stored.find(
       (l) =>
         l.phone.replace(/\D/g, '') === cleanPhone.replace(/\D/g, '') &&
         l.service.toLowerCase() === cleanService.toLowerCase() &&
         l.timestamp >= twoMinsAgo
     );
 
-    if (isDup) {
+    if (matchedDuplicate) {
+      setSubmittedPayload(matchedDuplicate);
+      setWhatsAppRedirectClicked(false);
       setFormSubmitted(true);
       setFormSubmitting(false);
       return;
@@ -186,6 +221,7 @@ export const LiveWebsitePreview: React.FC<LiveWebsitePreviewProps> = ({ config, 
       }
 
       setSubmittedPayload(savedLead);
+      setWhatsAppRedirectClicked(false);
       setFormSubmitted(true);
       setFormData({
         name: '',
@@ -478,27 +514,76 @@ export const LiveWebsitePreview: React.FC<LiveWebsitePreviewProps> = ({ config, 
                 </div>
               </div>
 
-              {formSubmitted ? (
-                <div className="bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-xl p-6 text-center space-y-3">
-                  <CheckCircle2 className="w-12 h-12 text-emerald-600 mx-auto" />
-                  <div>
-                    <h4 className="text-base font-extrabold text-emerald-950">
-                      Request received — we'll contact you shortly.
-                    </h4>
-                    <p className="text-xs text-emerald-800 mt-1 leading-relaxed">
-                      Thank you for contacting <strong>{config.businessName}</strong>. Our team has received your service request and will call you back promptly.
-                    </p>
+              {formSubmitted ? (() => {
+                const ownerWhatsAppUrl = buildOwnerWhatsAppRedirectUrl(config, submittedPayload);
+                return (
+                  <div className="bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-xl p-5 sm:p-6 text-center space-y-3.5">
+                    <CheckCircle2 className="w-11 h-11 text-emerald-600 mx-auto" />
+                    <div>
+                      <h4 className="text-base font-extrabold text-emerald-950">
+                        Request received — we'll contact you shortly.
+                      </h4>
+                      <p className="text-xs text-emerald-800 mt-1 leading-relaxed">
+                        Thank you for contacting <strong>{config.businessName}</strong>. Our team has received your service request and will reach out promptly.
+                      </p>
+                    </div>
+
+                    {submittedPayload?.id && (
+                      <div className="bg-white/90 border border-emerald-200 rounded-lg p-3 text-left text-xs space-y-1 shadow-sm">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-emerald-700 font-bold uppercase text-[10px] tracking-wider">Reference ID</span>
+                          <span className="font-mono font-extrabold text-emerald-950 bg-emerald-100 px-2 py-0.5 rounded">
+                            {submittedPayload.id}
+                          </span>
+                        </div>
+                        {submittedPayload.service && (
+                          <div className="text-slate-700 truncate">
+                            <span className="font-semibold">Service:</span> {submittedPayload.service}
+                          </div>
+                        )}
+                        {submittedPayload.phone && (
+                          <div className="text-slate-700">
+                            <span className="font-semibold">Contact:</span> {submittedPayload.phone}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {ownerWhatsAppUrl && (
+                      <div className="pt-1 space-y-1.5">
+                        <a
+                          href={ownerWhatsAppUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={() => setWhatsAppRedirectClicked(true)}
+                          className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-xs sm:text-sm py-3 px-4 rounded-xl shadow-md transition flex items-center justify-center gap-2"
+                        >
+                          <MessageSquare className="w-4 h-4 shrink-0" />
+                          <span>Continue on WhatsApp ↗</span>
+                        </a>
+                        <p className="text-[11px] text-emerald-700">
+                          {whatsAppRedirectClicked
+                            ? `WhatsApp chat link opened for ${config.businessName} with your reference details pre-filled.`
+                            : `Opens WhatsApp with your reference ID and enquiry details ready to send.`}
+                        </p>
+                      </div>
+                    )}
+
+                    <div className="pt-1">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setFormSubmitted(false);
+                          setWhatsAppRedirectClicked(false);
+                        }}
+                        className="text-xs font-bold text-emerald-800 hover:text-emerald-950 underline inline-block cursor-pointer"
+                      >
+                        ← Submit another request
+                      </button>
+                    </div>
                   </div>
-                  <div className="pt-2">
-                    <button
-                      onClick={() => setFormSubmitted(false)}
-                      className="text-xs font-bold text-emerald-800 hover:text-emerald-950 underline inline-block"
-                    >
-                      ← Submit another request
-                    </button>
-                  </div>
-                </div>
-              ) : (
+                );
+              })() : (
                 <form onSubmit={handleLeadSubmit} className="space-y-3">
                   {formError && (
                     <div className="bg-rose-50 border border-rose-200 text-rose-900 p-3 rounded-lg text-xs font-medium space-y-2">

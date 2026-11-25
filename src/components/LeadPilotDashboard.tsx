@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { ClientConfig, LeadItem, LeadStatus, ContactMethod } from '../types';
 import { LeadImportModal } from './LeadImportModal';
 import { ManualLeadModal } from './ManualLeadModal';
@@ -12,6 +12,7 @@ import {
   addLeadNote,
   scheduleLeadFollowUp,
   logLeadContact,
+  updateLeadPhone,
   testGoogleSheetConnection,
   deduplicateLeads,
   subscribeTenantLeads,
@@ -134,9 +135,10 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
 
   // Sync state
   const [isSyncing, setIsSyncing] = useState(false);
+  const isSyncingRef = useRef(false);
   const [lastSyncTime, setLastSyncTime] = useState<string | null>(null);
   const [syncingAction, setSyncingAction] = useState(false);
-  const [actionNotification, setActionNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [actionNotification, setActionNotification] = useState<{ type: 'success' | 'warning' | 'error'; message: string } | null>(null);
 
   // Connection testing state
   const [connStatus, setConnStatus] = useState<'testing' | 'connected' | 'failed' | 'unconfigured'>('unconfigured');
@@ -286,7 +288,8 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
 
   // Sync Remote Leads from Google Sheet into CRM
   const handleSyncRemoteLeads = async (silent = false) => {
-    if (isSyncing) return;
+    if (isSyncingRef.current) return;
+    isSyncingRef.current = true;
     setIsSyncing(true);
     try {
       const summary = await syncGoogleSheetToCrm(endpoint, activeTenantScope);
@@ -318,6 +321,7 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
         });
       }
     } finally {
+      isSyncingRef.current = false;
       setIsSyncing(false);
     }
   };
@@ -331,7 +335,7 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
     }, 60000); // 60-second periodic sync
 
     return () => clearInterval(interval);
-  }, [autoSyncEnabled, endpoint, activeTenantScope, isSyncing]);
+  }, [autoSyncEnabled, endpoint, activeTenantScope]);
 
   useEffect(() => {
     refreshLocalLeads();
@@ -407,20 +411,35 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
     return formatPhoneForWhatsApp(phoneStr, selectedCountryCode);
   };
 
-  const handleSaveEditedPhone = () => {
+  const handleSaveEditedPhone = async () => {
     if (!selectedLead || !editedPhoneInput.trim()) return;
     const formatted = normalizeImportedPhone(editedPhoneInput.trim(), selectedCountryCode);
-    const updatedLead: LeadItem = { ...selectedLead, phone: formatted };
-    setSelectedLead(updatedLead);
-    const stored = getStoredLeads(activeTenantScope);
-    const idx = stored.findIndex((l) => l.id === selectedLead.id);
-    if (idx !== -1) {
-      stored[idx] = updatedLead;
-      saveAllLeads(stored, activeTenantScope);
+    setSyncingAction(true);
+    try {
+      const res = await updateLeadPhone(
+        selectedLead.id,
+        formatted,
+        selectedLead.clientId || activeTenantScope,
+        endpoint
+      );
+      if (!res.success) {
+        setActionNotification({ type: 'error', message: res.message || 'Failed to save phone number.' });
+        return;
+      }
+      if (res.lead) setSelectedLead(res.lead);
       refreshLocalLeads();
+      setIsEditingPhone(false);
+      setActionNotification({
+        type: 'success',
+        message: res.sheetSynced
+          ? `Phone updated to ${formatted} & synced to Google Sheet ✓`
+          : `Phone updated to ${formatted} in CRM ✓`,
+      });
+    } catch (err: any) {
+      setActionNotification({ type: 'error', message: err?.message || 'Error updating phone number.' });
+    } finally {
+      setSyncingAction(false);
     }
-    setIsEditingPhone(false);
-    setActionNotification({ type: 'success', message: `Phone updated to ${formatted} ✓` });
   };
 
   // Filter leads based on Client ID, Status Tab, and Search Query
@@ -535,7 +554,6 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
       setActionNotification({ type: 'error', message: 'No valid phone number found for this lead.' });
       return;
     }
-    // Initiate call immediately
     window.location.href = `tel:+${raw}`;
 
     setSyncingAction(true);
@@ -544,12 +562,17 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
       const res = await logLeadContact(lead.id, 'Call', undefined, lead.clientId || activeTenantScope, endpoint);
       if (res.success) {
         refreshLocalLeads();
-        setActionNotification({ type: 'success', message: `Call initiated (+${raw}) & logged ✓` });
+        setActionNotification({
+          type: 'success',
+          message: res.sheetSynced
+            ? `Call initiated (+${raw}), logged & synced to Google Sheet ✓`
+            : `Call initiated (+${raw}) & saved to CRM ✓`,
+        });
       } else {
-        setActionNotification({ type: 'warning', message: `Call initiated (+${raw}). Sheet sync notice: ${res.message}` });
+        setActionNotification({ type: 'warning', message: `Call initiated (+${raw}). Notice: ${res.message}` });
       }
-    } catch (err: any) {
-      setActionNotification({ type: 'warning', message: `Call initiated (+${raw}). Contact logged locally.` });
+    } catch {
+      setActionNotification({ type: 'warning', message: `Call initiated (+${raw}). Contact saved locally.` });
     } finally {
       setSyncingAction(false);
     }
@@ -565,7 +588,6 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
     const msg = overrideMsg || (selectedLead?.id === lead.id && customLeadWhatsAppMsg ? customLeadWhatsAppMsg : getWhatsAppMessage(lead));
     const waUrl = `https://wa.me/${raw}?text=${encodeURIComponent(msg)}`;
 
-    // Open WhatsApp immediately in user interaction context to prevent browser popup blockers
     try {
       window.open(waUrl, '_blank', 'noopener,noreferrer');
     } catch {
@@ -578,12 +600,17 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
       const res = await logLeadContact(lead.id, 'WhatsApp', undefined, lead.clientId || activeTenantScope, endpoint);
       if (res.success) {
         refreshLocalLeads();
-        setActionNotification({ type: 'success', message: `WhatsApp opened (+${raw}) & contact logged to Google Sheet ✓` });
+        setActionNotification({
+          type: 'success',
+          message: res.sheetSynced
+            ? `WhatsApp opened (+${raw}) & logged to Google Sheet ✓`
+            : `WhatsApp opened (+${raw}) & contact saved to CRM ✓`,
+        });
       } else {
-        setActionNotification({ type: 'warning', message: `WhatsApp opened (+${raw}). Remote sheet notice: ${res.message}` });
+        setActionNotification({ type: 'warning', message: `WhatsApp opened (+${raw}). CRM notice: ${res.message}` });
       }
-    } catch (err: any) {
-      setActionNotification({ type: 'warning', message: `WhatsApp opened (+${raw}). Contact logged locally.` });
+    } catch {
+      setActionNotification({ type: 'warning', message: `WhatsApp opened (+${raw}). Contact saved locally.` });
     } finally {
       setSyncingAction(false);
     }
@@ -597,8 +624,7 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
       return;
     }
     const msg = `Hi ${lead.name}, this is ${lead.businessName}. We received your request for ${lead.service}. We’ll be in touch shortly.`;
-    
-    // Initiate SMS immediately
+
     window.location.href = `sms:+${raw}?body=${encodeURIComponent(msg)}`;
 
     setSyncingAction(true);
@@ -607,12 +633,17 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
       const res = await logLeadContact(lead.id, 'SMS', undefined, lead.clientId || activeTenantScope, endpoint);
       if (res.success) {
         refreshLocalLeads();
-        setActionNotification({ type: 'success', message: `SMS opened (+${raw}) & contact logged ✓` });
+        setActionNotification({
+          type: 'success',
+          message: res.sheetSynced
+            ? `SMS opened (+${raw}) & synced to Google Sheet ✓`
+            : `SMS opened (+${raw}) & saved to CRM ✓`,
+        });
       } else {
-        setActionNotification({ type: 'warning', message: `SMS opened (+${raw}). Sheet sync notice: ${res.message}` });
+        setActionNotification({ type: 'warning', message: `SMS opened (+${raw}). Notice: ${res.message}` });
       }
-    } catch (err: any) {
-      setActionNotification({ type: 'warning', message: `SMS opened (+${raw}). Contact logged locally.` });
+    } catch {
+      setActionNotification({ type: 'warning', message: `SMS opened (+${raw}). Contact saved locally.` });
     } finally {
       setSyncingAction(false);
     }
@@ -628,14 +659,19 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
     try {
       const res = await logLeadContact(lead.id, 'Email', undefined, lead.clientId || activeTenantScope, endpoint);
       if (!res.success) {
-        setActionNotification({ type: 'error', message: `Sync failed: ${res.message}` });
+        setActionNotification({ type: 'error', message: `Could not log email contact: ${res.message}` });
         return;
       }
       refreshLocalLeads();
-      setActionNotification({ type: 'success', message: 'Email contact logged and synced to Google Sheet ✓' });
+      setActionNotification({
+        type: 'success',
+        message: res.sheetSynced
+          ? 'Email contact logged & synced to Google Sheet ✓'
+          : 'Email contact logged to CRM ✓',
+      });
       window.location.href = `mailto:${lead.email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
     } catch (err: any) {
-      setActionNotification({ type: 'error', message: `Error syncing contact log: ${err?.message || 'Unknown error'}` });
+      setActionNotification({ type: 'error', message: `Error logging email contact: ${err?.message || 'Unknown error'}` });
     } finally {
       setSyncingAction(false);
     }
@@ -648,11 +684,16 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
     try {
       const res = await updateLeadStatus(leadId, newStatus, selectedLead?.clientId || activeTenantScope, endpoint);
       if (!res.success) {
-        setActionNotification({ type: 'error', message: `Failed to update status on Google Sheet: ${res.message}` });
+        setActionNotification({ type: 'error', message: `Failed to update status: ${res.message}` });
         return;
       }
       refreshLocalLeads();
-      setActionNotification({ type: 'success', message: `Status updated to "${newStatus}" and synced to Google Sheet ✓` });
+      setActionNotification({
+        type: 'success',
+        message: res.sheetSynced
+          ? `Status updated to "${newStatus}" & synced to Google Sheet ✓`
+          : `Status updated to "${newStatus}" in CRM ✓`,
+      });
     } catch (err: any) {
       setActionNotification({ type: 'error', message: `Error updating status: ${err?.message || 'Unknown error'}` });
     } finally {
@@ -669,12 +710,15 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
     try {
       const res = await addLeadNote(selectedLead.id, newNoteText, 'Agent', selectedLead.clientId || activeTenantScope, endpoint);
       if (!res.success) {
-        setActionNotification({ type: 'error', message: `Failed to add note on Google Sheet: ${res.message}` });
+        setActionNotification({ type: 'error', message: `Failed to save note: ${res.message}` });
         return;
       }
       setNewNoteText('');
       refreshLocalLeads();
-      setActionNotification({ type: 'success', message: 'Note added and synced to Google Sheet ✓' });
+      setActionNotification({
+        type: 'success',
+        message: res.sheetSynced ? 'Note added & synced to Google Sheet ✓' : 'Note saved to CRM ✓',
+      });
     } catch (err: any) {
       setActionNotification({ type: 'error', message: `Error adding note: ${err?.message || 'Unknown error'}` });
     } finally {
@@ -693,11 +737,16 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
     try {
       const res = await scheduleLeadFollowUp(selectedLead.id, combinedIso, selectedLead.clientId || activeTenantScope, endpoint);
       if (!res.success) {
-        setActionNotification({ type: 'error', message: `Failed to schedule follow-up on Google Sheet: ${res.message}` });
+        setActionNotification({ type: 'error', message: `Failed to schedule follow-up: ${res.message}` });
         return;
       }
       refreshLocalLeads();
-      setActionNotification({ type: 'success', message: 'Follow-up scheduled and synced to Google Sheet ✓' });
+      setActionNotification({
+        type: 'success',
+        message: res.sheetSynced
+          ? 'Follow-up scheduled & synced to Google Sheet ✓'
+          : 'Follow-up scheduled in CRM ✓',
+      });
     } catch (err: any) {
       setActionNotification({ type: 'error', message: `Error scheduling follow-up: ${err?.message || 'Unknown error'}` });
     } finally {
@@ -713,12 +762,17 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
     try {
       const res = await scheduleLeadFollowUp(selectedLead.id, '', selectedLead.clientId || activeTenantScope, endpoint);
       if (!res.success) {
-        setActionNotification({ type: 'error', message: `Failed to clear follow-up on Google Sheet: ${res.message}` });
+        setActionNotification({ type: 'error', message: `Failed to clear follow-up: ${res.message}` });
         return;
       }
       setFollowUpDateInput('');
       refreshLocalLeads();
-      setActionNotification({ type: 'success', message: 'Follow-up cleared and synced to Google Sheet ✓' });
+      setActionNotification({
+        type: 'success',
+        message: res.sheetSynced
+          ? 'Follow-up cleared & synced to Google Sheet ✓'
+          : 'Follow-up cleared in CRM ✓',
+      });
     } catch (err: any) {
       setActionNotification({ type: 'error', message: `Error clearing follow-up: ${err?.message || 'Unknown error'}` });
     } finally {
@@ -1054,12 +1108,16 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
             className={`p-3 rounded-xl text-xs flex items-center justify-between gap-2 shadow-lg ${
               actionNotification.type === 'success'
                 ? 'bg-emerald-950/80 border border-emerald-500 text-emerald-200'
+                : actionNotification.type === 'warning'
+                ? 'bg-amber-950/80 border border-amber-500 text-amber-200'
                 : 'bg-red-950/80 border border-red-500 text-red-200'
             }`}
           >
             <div className="flex items-center gap-2">
               {actionNotification.type === 'success' ? (
                 <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+              ) : actionNotification.type === 'warning' ? (
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
               ) : (
                 <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
               )}
@@ -1129,19 +1187,26 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
                 <div className="space-y-2 text-xs">
                   <div>
                     <span className="text-slate-500 block text-[10px] uppercase font-bold">Rating & Review Count</span>
-                    <span className="text-amber-400 font-bold">{currentConfig.rating} ★ ({currentConfig.reviewCount}+ Verified Reviews)</span>
+                    <span className="text-amber-400 font-bold">{currentConfig.averageRating ?? (currentConfig as any).googleRating ?? 0} ★ ({currentConfig.reviewCount || 0}+ Verified Reviews)</span>
                   </div>
                   <div>
                     <span className="text-slate-500 block text-[10px] uppercase font-bold">Tagline</span>
-                    <span className="text-slate-300 italic">"{currentConfig.tagline}"</span>
+                    <span className="text-slate-300 italic">"{currentConfig.tagline || 'Customer-first local business'}"</span>
                   </div>
                   <div>
-                    <span className="text-slate-500 block text-[10px] uppercase font-bold">License / Credentials</span>
-                    <span className="text-slate-300 font-mono">{currentConfig.licenseNumber || 'Licensed & Insured'}</span>
+                    <span className="text-slate-500 block text-[10px] uppercase font-bold">Credentials & Experience</span>
+                    <span className="text-slate-300 font-mono">
+                      {(currentConfig as any).licenseNumber || (currentConfig.yearsInBusiness ? `${currentConfig.yearsInBusiness}+ Years in Business` : 'Verified Local Business')}
+                    </span>
                   </div>
                   <div className="pt-2">
                     <a
-                      href={currentConfig.gbpUrl || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(currentConfig.businessName + ' ' + currentConfig.cityStateZip)}`}
+                      href={
+                        currentConfig.googleBusinessProfileUrl ||
+                        currentConfig.googleBusinessProfileLink ||
+                        currentConfig.googleMapsLink ||
+                        `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(currentConfig.businessName + ' ' + currentConfig.cityStateZip)}`
+                      }
                       target="_blank"
                       rel="noopener noreferrer"
                       className="inline-flex items-center gap-1.5 bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs px-3 py-1.5 rounded-lg transition"
@@ -1179,7 +1244,7 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
                   </div>
                   <div>
                     <span className="text-slate-500 block text-[10px] uppercase font-bold">Operating Hours</span>
-                    <span className="text-slate-300">{currentConfig.hours}</span>
+                    <span className="text-slate-300">{currentConfig.businessHours || 'Standard Business Hours'}</span>
                   </div>
                 </div>
               </div>
@@ -1274,6 +1339,99 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
             <div className="text-[10px] text-slate-500 mt-1 truncate">Closed / Lost</div>
           </div>
         </div>
+
+        {/* 2B. CONVERSION FUNNEL & PERFORMANCE METRICS */}
+        {(() => {
+          const followUpStageCount = currentClientLeads.filter((l) => l.status === 'Follow-up').length;
+          const qualifiedStageCount = currentClientLeads.filter((l) => l.status === 'Qualified').length;
+          const contactedOrBeyondCount = currentClientLeads.filter((l) => l.status !== 'New' && l.status !== 'Lost').length;
+          const qualifiedOrWonCount = qualifiedStageCount + wonCount;
+          const totalTouches = currentClientLeads.reduce((acc, l) => acc + (l.contactCount || 0), 0);
+
+          const contactRatePct = totalLeadsCount > 0 ? Math.round((contactedOrBeyondCount / totalLeadsCount) * 100) : 0;
+          const qualificationRatePct = totalLeadsCount > 0 ? Math.round((qualifiedOrWonCount / totalLeadsCount) * 100) : 0;
+          const winRatePct = totalLeadsCount > 0 ? Math.round((wonCount / totalLeadsCount) * 100) : 0;
+          const avgTouches = totalLeadsCount > 0 ? (totalTouches / totalLeadsCount).toFixed(1) : '0.0';
+
+          const funnelStages: Array<{ label: LeadStatus; count: number; barColor: string }> = [
+            { label: 'New', count: newLeadsCount, barColor: 'bg-emerald-500' },
+            { label: 'Contacted', count: contactedCount, barColor: 'bg-blue-500' },
+            { label: 'Follow-up', count: followUpStageCount, barColor: 'bg-amber-500' },
+            { label: 'Qualified', count: qualifiedStageCount, barColor: 'bg-purple-500' },
+            { label: 'Won', count: wonCount, barColor: 'bg-emerald-400' },
+          ];
+
+          return (
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+              {/* Conversion Funnel */}
+              <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow-lg">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xs font-extrabold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                    <TrendingUp className="w-4 h-4 text-emerald-400" />
+                    Conversion Funnel
+                  </h2>
+                  <span className="text-[11px] text-slate-400 font-mono">
+                    {totalLeadsCount} total lead(s)
+                  </span>
+                </div>
+                <div className="space-y-2.5">
+                  {funnelStages.map((stage) => {
+                    const pct = totalLeadsCount > 0 ? Math.round((stage.count / totalLeadsCount) * 100) : 0;
+                    return (
+                      <div key={stage.label} className="space-y-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-bold text-slate-300">{stage.label}</span>
+                          <span className="font-mono text-slate-400">
+                            <strong className="text-white">{stage.count}</strong> ({pct}%)
+                          </span>
+                        </div>
+                        <div className="w-full h-2 bg-slate-950 rounded-full overflow-hidden border border-slate-800">
+                          <div
+                            className={`h-full ${stage.barColor} transition-all duration-300`}
+                            style={{ width: `${Math.max(pct, stage.count > 0 ? 4 : 0)}%` }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Performance Metrics */}
+              <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow-lg">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xs font-extrabold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                    <ShieldCheck className="w-4 h-4 text-blue-400" />
+                    Performance Metrics
+                  </h2>
+                  <span className="text-[11px] text-slate-400">Live CRM Pipeline</span>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase block">Contact Rate</span>
+                    <div className="text-xl font-black text-blue-400 mt-1">{contactRatePct}%</div>
+                    <span className="text-[10px] text-slate-500">Leads engaged</span>
+                  </div>
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase block">Qualification Rate</span>
+                    <div className="text-xl font-black text-purple-400 mt-1">{qualificationRatePct}%</div>
+                    <span className="text-[10px] text-slate-500">Qualified or won</span>
+                  </div>
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase block">Deal Win Rate</span>
+                    <div className="text-xl font-black text-emerald-400 mt-1">{winRatePct}%</div>
+                    <span className="text-[10px] text-slate-500">{wonCount} deal(s) won</span>
+                  </div>
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase block">Avg Contact Touches</span>
+                    <div className="text-xl font-black text-amber-400 mt-1">{avgTouches}</div>
+                    <span className="text-[10px] text-slate-500">{totalTouches} total log(s)</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* 3A. OVERDUE FOLLOW-UPS PROMINENT BOX */}
         {overdueFollowUps.length > 0 && (
@@ -1827,31 +1985,65 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
                       className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white text-xs leading-relaxed focus:border-emerald-500 outline-none"
                     />
 
-                    {/* Quick Preset Buttons for Tarot / General */}
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      <span className="text-[10px] text-slate-400 uppercase font-bold tracking-wider">Presets:</span>
-                      <button
-                        type="button"
-                        onClick={() => setCustomLeadWhatsAppMsg(getWhatsAppMessage(selectedLead, 'Hi {name}, thank you for reaching out to {businessName} regarding your Tarot Reading session ({service}). When would you like to schedule your guidance reading?'))}
-                        className="text-[10px] bg-purple-950/70 hover:bg-purple-900 text-purple-200 border border-purple-800/60 px-2 py-0.5 rounded transition"
-                      >
-                        🔮 Tarot Booking
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setCustomLeadWhatsAppMsg(getWhatsAppMessage(selectedLead, 'Namaste {name}, this is {businessName}. We received your Tarot inquiry for {service}. Are you available for a quick discussion on WhatsApp?'))}
-                        className="text-[10px] bg-amber-950/70 hover:bg-amber-900 text-amber-200 border border-amber-800/60 px-2 py-0.5 rounded transition"
-                      >
-                        ✨ Consultation
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setCustomLeadWhatsAppMsg(getWhatsAppMessage(selectedLead, 'Hi {name}, following up regarding your Tarot session with {businessName}. Let us know your preferred date and time!'))}
-                        className="text-[10px] bg-blue-950/70 hover:bg-blue-900 text-blue-200 border border-blue-800/60 px-2 py-0.5 rounded transition"
-                      >
-                        📅 Follow-up
-                      </button>
-                    </div>
+                    {/* Quick Preset Buttons */}
+                    {(() => {
+                      const isTarotClient =
+                        (currentConfig.industry ?? '').toLowerCase().includes('tarot') ||
+                        (currentConfig.clientId ?? '').toLowerCase().includes('tarot') ||
+                        (currentConfig.businessName ?? '').toLowerCase().includes('tarot');
+
+                      const presets = isTarotClient
+                        ? [
+                            {
+                              label: '🔮 Tarot Booking',
+                              tpl: 'Hi {name}, thank you for reaching out to {businessName} regarding your Tarot Reading session ({service}). When would you like to schedule your guidance reading?',
+                              cls: 'bg-purple-950/70 hover:bg-purple-900 text-purple-200 border-purple-800/60',
+                            },
+                            {
+                              label: '✨ Consultation',
+                              tpl: 'Namaste {name}, this is {businessName}. We received your inquiry for {service}. Are you available for a quick discussion on WhatsApp?',
+                              cls: 'bg-amber-950/70 hover:bg-amber-900 text-amber-200 border-amber-800/60',
+                            },
+                            {
+                              label: '📅 Follow-up',
+                              tpl: 'Hi {name}, following up regarding your Tarot session with {businessName}. Let us know your preferred date and time!',
+                              cls: 'bg-blue-950/70 hover:bg-blue-900 text-blue-200 border-blue-800/60',
+                            },
+                          ]
+                        : [
+                            {
+                              label: '👋 Initial Reply',
+                              tpl: 'Hi {name}, this is {businessName}. Thank you for reaching out regarding {service}. How can we assist you today?',
+                              cls: 'bg-emerald-950/70 hover:bg-emerald-900 text-emerald-200 border-emerald-800/60',
+                            },
+                            {
+                              label: '🛠️ Estimate / Booking',
+                              tpl: 'Hi {name}, we received your request for {service} with {businessName}. What date and time works best for a quick call or visit?',
+                              cls: 'bg-amber-950/70 hover:bg-amber-900 text-amber-200 border-amber-800/60',
+                            },
+                            {
+                              label: '📅 Follow-up',
+                              tpl: 'Hi {name}, following up on your {service} enquiry with {businessName}. Let us know if you would like to proceed!',
+                              cls: 'bg-blue-950/70 hover:bg-blue-900 text-blue-200 border-blue-800/60',
+                            },
+                          ];
+
+                      return (
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-[10px] text-slate-400 uppercase font-bold tracking-wider">Presets:</span>
+                          {presets.map((p) => (
+                            <button
+                              key={p.label}
+                              type="button"
+                              onClick={() => setCustomLeadWhatsAppMsg(getWhatsAppMessage(selectedLead, p.tpl))}
+                              className={`text-[10px] border px-2 py-0.5 rounded transition ${p.cls}`}
+                            >
+                              {p.label}
+                            </button>
+                          ))}
+                        </div>
+                      );
+                    })()}
 
                     <div className="flex items-center justify-between pt-1 border-t border-slate-800/80">
                       <button
@@ -1865,10 +2057,10 @@ export const LeadPilotDashboard: React.FC<LeadPilotDashboardProps> = ({
                       </button>
                       <button
                         onClick={() => handleActionWhatsApp(selectedLead, undefined, customLeadWhatsAppMsg)}
-                        className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-3 py-1 rounded-lg transition flex items-center gap-1.5 shadow"
+                        className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-3 py-1 rounded-lg transition flex items-center gap-1.5 shadow cursor-pointer"
                       >
                         <MessageSquare className="w-3.5 h-3.5" />
-                        <span>Send via WhatsApp ↗</span>
+                        <span>Open WhatsApp ↗</span>
                       </button>
                     </div>
                   </div>
