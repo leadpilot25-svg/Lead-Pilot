@@ -127,64 +127,370 @@ export function inferTenantFromEmail(email: string): string {
   return `client-${slug}`;
 }
 
+// Track last onboarding denial reason for clear UI feedback (e.g., wrong/uninvited email, unverified email, suspended tenant)
+let lastGoogleOnboardingError: string | null = null;
+const inFlightProfileResolutions = new Map<string, Promise<ClientUser>>();
+
+export function getLastGoogleOnboardingError(): string | null {
+  return lastGoogleOnboardingError;
+}
+
+export function clearLastGoogleOnboardingError(): void {
+  lastGoogleOnboardingError = null;
+}
+
 /**
- * Fetch or bootstrap user profile document in Firestore
+ * Determine whether a Firebase user authenticated via Google with a verified email.
  */
-export async function getOrProvisionUserProfile(user: FirebaseUser, desiredTenantId?: string): Promise<ClientUser> {
-  const userRef = doc(db, 'users', user.uid);
-  let tenantId = desiredTenantId || '';
-  let businessName = 'Business Client Portal';
-  let role: 'client_admin' | 'client_staff' = 'client_admin';
+export async function isGoogleVerifiedFirebaseUser(user: FirebaseUser | null): Promise<{
+  isGoogle: boolean;
+  emailVerified: boolean;
+  email: string;
+}> {
+  if (!user) {
+    return { isGoogle: false, emailVerified: false, email: '' };
+  }
+  const cleanEmail = (user.email || '').trim().toLowerCase();
+  const emailVerified = user.emailVerified === true;
 
-  try {
-    const snap = await getDoc(userRef);
-    if (snap.exists()) {
-      // Existing user: load securely provisioned tenant assignment and role from profile
-      const data = snap.data();
-      tenantId = data.tenantId || '';
-      const rawRole = (data.role || '').toString().toLowerCase().trim();
-      role =
-        rawRole === 'owner' || rawRole === 'admin' || rawRole === 'client_admin'
-          ? 'client_admin'
-          : 'client_staff';
-      businessName = data.businessName || TENANT_METADATA_MAP[tenantId]?.businessName || businessName;
-      // Note: No redundant background writes to /members or /tenants during existing user sessions
-    } else {
-      // First-time sign-in: write initial baseline profile conforming to zero-trust rules
-      // (Non-admin users cannot self-assign privileged roles or arbitrary tenant IDs)
-      tenantId = '';
-      role = 'client_staff';
-      const newUserData = {
-        uid: user.uid,
-        email: user.email || '',
-        displayName: user.displayName || user.email?.split('@')[0] || 'Client User',
-        tenantId: '',
-        businessName: 'Unassigned Client Portal',
-        role: 'unassigned',
-        createdAt: new Date().toISOString(),
-      };
-
-      try {
-        await setDoc(userRef, newUserData);
-      } catch (writeErr) {
-        console.warn('Note: Could not create user profile document:', writeErr);
-      }
+  let signInProvider: string | null = null;
+  if (typeof (user as any).getIdTokenResult === 'function') {
+    try {
+      const tokenResult = await (user as any).getIdTokenResult();
+      signInProvider = tokenResult?.signInProvider || null;
+    } catch {
+      signInProvider = null;
     }
-  } catch (err) {
-    console.warn('Reading user profile from Firestore:', err);
   }
 
-  const clientUser: ClientUser = {
-    userId: user.uid,
-    email: user.email || '',
-    clientId: tenantId,
-    businessName,
-    role,
-    createdAt: new Date().toISOString(),
-  };
+  const providerIds = Array.isArray(user.providerData)
+    ? user.providerData.map((p) => p?.providerId).filter((id): id is string => Boolean(id))
+    : [];
 
-  activeSessionUser = clientUser;
-  return clientUser;
+  const isGoogle =
+    signInProvider !== null ? signInProvider === 'google.com' : providerIds.includes('google.com');
+
+  return { isGoogle, emailVerified, email: cleanEmail };
+}
+
+/**
+ * Atomically claim tenant owner membership for a verified Google user whose email matches
+ * /ownerInvites/{sha256(email)} and an active, unclaimed /tenants/{tenantId}.
+ */
+export async function claimOwnerMembershipByGoogleUser(user: FirebaseUser): Promise<{
+  claimed: boolean;
+  tenantId?: string;
+  businessName?: string;
+  denialReason?: string;
+}> {
+  const identity = await isGoogleVerifiedFirebaseUser(user);
+  if (!identity.email) {
+    return {
+      claimed: false,
+      denialReason: 'Your Google account does not have an email address.',
+    };
+  }
+  if (!identity.isGoogle) {
+    return { claimed: false };
+  }
+  if (!identity.emailVerified) {
+    return {
+      claimed: false,
+      denialReason: 'Access denied: Your Google email address is not verified.',
+    };
+  }
+
+  // Root Admin never claims a client tenant owner invite
+  if (
+    matchesRootAdminIdentity({
+      email: identity.email,
+      emailVerified: identity.emailVerified,
+      signInProvider: 'google.com',
+    })
+  ) {
+    return { claimed: false };
+  }
+
+  const emailHash = await computeEmailHash(identity.email);
+  if (!emailHash) {
+    return { claimed: false, denialReason: 'Unable to verify owner email identifier.' };
+  }
+
+  const inviteRef = doc(db, 'ownerInvites', emailHash);
+  let inviteSnap;
+  try {
+    inviteSnap = await getDoc(inviteRef);
+  } catch (err: any) {
+    const code = err?.code || '';
+    if (code === 'permission-denied') {
+      return {
+        claimed: false,
+        denialReason: `Access denied: "${identity.email}" is not approved for any active LeadPilot business. Please ask your administrator to assign your Google email.`,
+      };
+    }
+    return {
+      claimed: false,
+      denialReason: err?.message || 'Unable to verify your business owner invitation.',
+    };
+  }
+
+  if (!inviteSnap.exists()) {
+    return {
+      claimed: false,
+      denialReason: `Access denied: "${identity.email}" is not approved for any active LeadPilot business.`,
+    };
+  }
+
+  const inviteData = inviteSnap.data();
+  const approvedEmail = (inviteData?.ownerEmail || '').trim().toLowerCase();
+  const targetTenantId = (inviteData?.tenantId || '').trim().toLowerCase();
+  const businessName =
+    inviteData?.businessName ||
+    TENANT_METADATA_MAP[targetTenantId]?.businessName ||
+    targetTenantId ||
+    'Business Client Portal';
+
+  if (!targetTenantId || approvedEmail !== identity.email) {
+    return {
+      claimed: false,
+      denialReason: `Access denied: Signed-in Google email "${identity.email}" does not match an approved business owner record.`,
+    };
+  }
+
+  if (inviteData.status === 'revoked') {
+    return {
+      claimed: false,
+      denialReason: `Access denied: The owner invitation for "${identity.email}" has been revoked.`,
+    };
+  }
+
+  if (inviteData.status === 'claimed') {
+    if (inviteData.claimedByUid && inviteData.claimedByUid !== user.uid) {
+      return {
+        claimed: false,
+        denialReason:
+          'Access denied: This business account has already been claimed by another Google user.',
+      };
+    }
+    return {
+      claimed: false,
+      denialReason:
+        'Access denied: This owner invitation has already been used.',
+    };
+  }
+
+  const timestamp = new Date().toISOString();
+  const memberRef = doc(db, 'tenants', targetTenantId, 'members', user.uid);
+  const tenantRef = doc(db, 'tenants', targetTenantId);
+  const userRef = doc(db, 'users', user.uid);
+
+  try {
+    await runTransaction(db, async (txn) => {
+      const [freshInviteSnap, existingUserSnap] = await Promise.all([
+        txn.get(inviteRef),
+        txn.get(userRef),
+      ]);
+
+      if (!freshInviteSnap.exists()) {
+        throw new Error('Owner invitation record no longer exists.');
+      }
+      const freshInvite = freshInviteSnap.data();
+      if (freshInvite.status !== 'pending') {
+        throw new Error('This business account has already been claimed or revoked.');
+      }
+
+      const existingCreatedAt = existingUserSnap.exists()
+        ? existingUserSnap.data()?.createdAt || timestamp
+        : timestamp;
+
+      // 1. Create /tenants/{tenantId}/members/{uid} with role: 'owner'
+      txn.set(memberRef, {
+        uid: user.uid,
+        email: identity.email,
+        role: 'owner',
+        ownerInviteHash: emailHash,
+        addedAt: timestamp,
+      });
+
+      // 2. Lock /tenants/{tenantId}.ownerUid to prevent second-user claim
+      txn.update(tenantRef, {
+        ownerUid: user.uid,
+        updatedAt: timestamp,
+      });
+
+      // 3. Mark /ownerInvites/{emailHash} as claimed atomically
+      txn.update(inviteRef, {
+        status: 'claimed',
+        claimedByUid: user.uid,
+        claimedAt: timestamp,
+        updatedAt: timestamp,
+      });
+
+      // 4. Provision/upgrade /users/{uid} strictly within schema keys
+      txn.set(userRef, {
+        uid: user.uid,
+        email: identity.email,
+        displayName: user.displayName || identity.email.split('@')[0] || 'Business Owner',
+        businessName,
+        tenantId: targetTenantId,
+        role: 'owner',
+        createdAt: existingCreatedAt,
+      });
+    });
+
+    return {
+      claimed: true,
+      tenantId: targetTenantId,
+      businessName,
+    };
+  } catch (err: any) {
+    const code = err?.code || '';
+    if (code === 'permission-denied') {
+      return {
+        claimed: false,
+        denialReason: `Access denied for "${businessName}" (${targetTenantId}): The business account may be suspended, already claimed by another user, or awaiting activation.`,
+      };
+    }
+    return {
+      claimed: false,
+      denialReason: err?.message || 'Unable to connect your Google account to the business tenant.',
+    };
+  }
+}
+
+/**
+ * Fetch or bootstrap user profile document in Firestore.
+ * For verified Google users without an assigned tenant, attempts atomic email-matched owner claiming
+ * unless the session is claiming a team staff invitation link.
+ */
+export async function getOrProvisionUserProfile(user: FirebaseUser, desiredTenantId?: string): Promise<ClientUser> {
+  const existingInFlight = inFlightProfileResolutions.get(user.uid);
+  if (existingInFlight) {
+    return existingInFlight;
+  }
+
+  const resolutionPromise = (async (): Promise<ClientUser> => {
+    const userRef = doc(db, 'users', user.uid);
+    let tenantId = desiredTenantId || '';
+    let businessName = 'Business Client Portal';
+    let role: 'client_admin' | 'client_staff' = 'client_admin';
+    let needsOnboardingClaim = false;
+
+    const hasPendingStaffInvite =
+      typeof window !== 'undefined' &&
+      Boolean(new URLSearchParams(window.location.search).get('inviteTenant')) &&
+      Boolean(new URLSearchParams(window.location.search).get('inviteHash'));
+
+    try {
+      const snap = await getDoc(userRef);
+      if (snap.exists()) {
+        const data = snap.data();
+        const existingTenant = (data.tenantId || '').trim();
+        const rawRole = (data.role || '').toString().toLowerCase().trim();
+
+        if (existingTenant && rawRole && rawRole !== 'unassigned') {
+          tenantId = existingTenant;
+          role =
+            rawRole === 'owner' || rawRole === 'admin' || rawRole === 'client_admin'
+              ? 'client_admin'
+              : 'client_staff';
+          businessName = data.businessName || TENANT_METADATA_MAP[tenantId]?.businessName || businessName;
+          lastGoogleOnboardingError = null;
+        } else {
+          needsOnboardingClaim = true;
+        }
+      } else {
+        needsOnboardingClaim = true;
+      }
+
+      if (needsOnboardingClaim && !hasPendingStaffInvite) {
+        const identity = await isGoogleVerifiedFirebaseUser(user);
+        const isRoot = matchesRootAdminIdentity({
+          email: user.email,
+          emailVerified: user.emailVerified,
+          signInProvider: identity.isGoogle ? 'google.com' : null,
+        });
+
+        if (identity.isGoogle && !isRoot) {
+          const claimRes = await claimOwnerMembershipByGoogleUser(user);
+          if (claimRes.claimed && claimRes.tenantId) {
+            tenantId = claimRes.tenantId;
+            businessName = claimRes.businessName || businessName;
+            role = 'client_admin';
+            lastGoogleOnboardingError = null;
+          } else {
+            tenantId = '';
+            role = 'client_staff';
+            businessName = 'Unassigned Client Portal';
+            lastGoogleOnboardingError =
+              claimRes.denialReason ||
+              `Access denied: No active business account is linked to "${identity.email || user.email}".`;
+          }
+        } else if (!snap.exists()) {
+          // First-time baseline unassigned profile for non-Google / Root Admin / Staff Invite signup
+          tenantId = '';
+          role = 'client_staff';
+          businessName = 'Unassigned Client Portal';
+          const newUserData = {
+            uid: user.uid,
+            email: user.email || '',
+            displayName: user.displayName || user.email?.split('@')[0] || 'Client User',
+            tenantId: '',
+            businessName: 'Unassigned Client Portal',
+            role: 'unassigned',
+            createdAt: new Date().toISOString(),
+          };
+          try {
+            await setDoc(userRef, newUserData);
+          } catch (writeErr) {
+            console.warn('Note: Could not create user profile document:', writeErr);
+          }
+        } else {
+          tenantId = '';
+          role = 'client_staff';
+          businessName = 'Unassigned Client Portal';
+        }
+      } else if (needsOnboardingClaim && hasPendingStaffInvite && !snap.exists()) {
+        tenantId = '';
+        role = 'client_staff';
+        businessName = 'Unassigned Client Portal';
+        try {
+          await setDoc(userRef, {
+            uid: user.uid,
+            email: user.email || '',
+            displayName: user.displayName || user.email?.split('@')[0] || 'Team Member',
+            tenantId: '',
+            businessName: 'Unassigned Client Portal',
+            role: 'unassigned',
+            createdAt: new Date().toISOString(),
+          });
+        } catch (writeErr) {
+          console.warn('Note: Could not create baseline user profile before invite claim:', writeErr);
+        }
+      }
+    } catch (err) {
+      console.warn('Reading user profile from Firestore:', err);
+    }
+
+    const clientUser: ClientUser = {
+      userId: user.uid,
+      email: user.email || '',
+      clientId: tenantId,
+      businessName,
+      role,
+      createdAt: new Date().toISOString(),
+    };
+
+    activeSessionUser = clientUser;
+    return clientUser;
+  })();
+
+  inFlightProfileResolutions.set(user.uid, resolutionPromise);
+  try {
+    return await resolutionPromise;
+  } finally {
+    inFlightProfileResolutions.delete(user.uid);
+  }
 }
 
 /**
@@ -211,6 +517,7 @@ export function onClientAuthStateChanged(callback: (user: ClientUser | null) => 
       }
     } else {
       activeSessionUser = null;
+      lastGoogleOnboardingError = null;
       callback(null);
     }
     window.dispatchEvent(new Event('leadpilot_auth_changed'));
@@ -269,11 +576,13 @@ export async function loginClient(
 }
 
 /**
- * Authenticate client using Firebase Google Sign-In Popup
+ * Authenticate client using Firebase Google Sign-In Popup.
+ * Automatically validates verified Google email against /ownerInvites and active tenant status.
  */
 export async function loginWithGoogle(
   desiredTenantId?: string
 ): Promise<{ success: boolean; user?: ClientUser; error?: string }> {
+  lastGoogleOnboardingError = null;
   try {
     const provider = new GoogleAuthProvider();
     provider.setCustomParameters({ prompt: 'select_account' });
@@ -281,6 +590,10 @@ export async function loginWithGoogle(
     const clientUser = await getOrProvisionUserProfile(cred.user, desiredTenantId);
     activeSessionUser = clientUser;
     window.dispatchEvent(new Event('leadpilot_auth_changed'));
+
+    if (!clientUser.clientId && lastGoogleOnboardingError) {
+      return { success: true, user: clientUser, error: lastGoogleOnboardingError };
+    }
     return { success: true, user: clientUser };
   } catch (err: any) {
     console.error('Google Sign-In error:', err);
@@ -462,6 +775,7 @@ export async function getTenantRecord(tenantId: string): Promise<TenantRecord | 
       status: resolveSafeTenantStatus(data.status),
       isPublished: Boolean(data.isPublished),
       ownerEmail: data.ownerEmail || '',
+      ownerUid: data.ownerUid || '',
       slug: data.slug || '',
       createdAt: data.createdAt || new Date().toISOString(),
       updatedAt: data.updatedAt,
@@ -489,6 +803,7 @@ export async function listTenantRecords(): Promise<TenantRecord[]> {
         status: resolveSafeTenantStatus(data.status),
         isPublished: Boolean(data.isPublished),
         ownerEmail: data.ownerEmail || '',
+        ownerUid: data.ownerUid || '',
         slug: data.slug || '',
         createdAt: data.createdAt || new Date().toISOString(),
         updatedAt: data.updatedAt,
@@ -506,7 +821,7 @@ export async function listTenantRecords(): Promise<TenantRecord[]> {
  * Uses runTransaction() to guarantee atomic creation:
  * - Reads document inside the transaction
  * - If document exists, rejects creation immediately
- * - If not, writes the new record within the same transaction
+ * - If ownerEmail is provided, reserves /ownerInvites/{emailHash} atomically
  * - Preserves existing administrator authorization through Firestore rules
  */
 export async function createTenantRecord(
@@ -515,6 +830,16 @@ export async function createTenantRecord(
   const cleanId = (tenant.tenantId || '').trim().toLowerCase();
   if (!cleanId) {
     return { success: false, error: 'Tenant ID is required.' };
+  }
+
+  const cleanOwnerEmail = tenant.ownerEmail ? tenant.ownerEmail.trim().toLowerCase() : '';
+  if (cleanOwnerEmail) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanOwnerEmail)) {
+      return { success: false, error: 'Please enter a valid Google owner email address.' };
+    }
+    if (cleanOwnerEmail === ROOT_ADMIN_EMAIL) {
+      return { success: false, error: 'Root Administrator email cannot be assigned as a client owner.' };
+    }
   }
 
   let normalizedSlug = '';
@@ -534,19 +859,24 @@ export async function createTenantRecord(
     industry: tenant.industry.trim() || 'general-business',
     status: safeStatus,
     isPublished: Boolean(tenant.isPublished),
-    ownerEmail: tenant.ownerEmail ? tenant.ownerEmail.trim().toLowerCase() : '',
+    ownerEmail: cleanOwnerEmail,
     ...(normalizedSlug ? { slug: normalizedSlug } : {}),
     createdAt: timestamp,
     updatedAt: timestamp,
   };
 
   try {
+    const ownerEmailHash = cleanOwnerEmail ? await computeEmailHash(cleanOwnerEmail) : '';
     const tenantDocRef = doc(db, 'tenants', cleanId);
     const slugDocRef = normalizedSlug ? doc(db, 'slugs', normalizedSlug) : null;
+    const ownerInviteRef = ownerEmailHash ? doc(db, 'ownerInvites', ownerEmailHash) : null;
 
     const result = await runTransaction(db, async (transaction) => {
-      const existingSnap = await transaction.get(tenantDocRef);
-      const existingSlugSnap = slugDocRef ? await transaction.get(slugDocRef) : null;
+      const [existingSnap, existingSlugSnap, existingOwnerInviteSnap] = await Promise.all([
+        transaction.get(tenantDocRef),
+        slugDocRef ? transaction.get(slugDocRef) : Promise.resolve(null),
+        ownerInviteRef ? transaction.get(ownerInviteRef) : Promise.resolve(null),
+      ]);
 
       if (existingSnap.exists()) {
         throw new Error(`Tenant "${cleanId}" already exists. Duplicate tenant creation rejected.`);
@@ -555,6 +885,17 @@ export async function createTenantRecord(
       if (existingSlugSnap && existingSlugSnap.exists()) {
         throw new Error(
           `Slug "${normalizedSlug}" is already registered to "${existingSlugSnap.data()?.tenantId}". Choose a different public URL slug.`
+        );
+      }
+
+      if (
+        existingOwnerInviteSnap &&
+        existingOwnerInviteSnap.exists() &&
+        existingOwnerInviteSnap.data()?.tenantId !== cleanId &&
+        existingOwnerInviteSnap.data()?.status !== 'revoked'
+      ) {
+        throw new Error(
+          `Owner email "${cleanOwnerEmail}" is already assigned to tenant "${existingOwnerInviteSnap.data()?.tenantId}". Use a unique Google email per business.`
         );
       }
 
@@ -580,6 +921,18 @@ export async function createTenantRecord(
         transaction.set(slugDocRef, {
           slug: normalizedSlug,
           tenantId: cleanId,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        });
+      }
+
+      if (ownerInviteRef && ownerEmailHash && cleanOwnerEmail) {
+        transaction.set(ownerInviteRef, {
+          emailHash: ownerEmailHash,
+          ownerEmail: cleanOwnerEmail,
+          tenantId: cleanId,
+          businessName: newRecord.businessName,
+          status: 'pending',
           createdAt: timestamp,
           updatedAt: timestamp,
         });
@@ -1207,151 +1560,209 @@ export async function listTenantMembers(tenantId: string): Promise<TenantMemberR
 }
 
 export interface TenantOwnerLoginInfo {
-  created: boolean;
+  connected: boolean;
   uid?: string;
   email?: string;
-  role: 'business_owner';
+  pendingEmail?: string;
+  role: 'owner';
   addedAt?: string;
 }
 
-export interface CreateClientLoginInput {
-  tenantId: string;
-  clientName: string;
-  clientEmail: string;
-  role?: 'business_owner';
-}
-
-export interface CreateClientLoginResult {
-  success: boolean;
-  uid?: string;
-  tenantId?: string;
-  clientName?: string;
-  clientEmail?: string;
-  role?: 'business_owner';
-  setupLink?: string;
-  emailSent?: boolean;
-  code?: string;
-  error?: string;
-}
-
 /**
- * Inspect existing /tenants/{tenantId}/members to determine whether a Business Owner CRM login
- * has already been created for the tenant.
+ * Inspect /tenants/{tenantId}/members and tenant record to determine whether a Business Owner
+ * has already connected via Google Sign-In or has a pending approved Google email.
  */
-export async function getTenantOwnerLoginInfo(tenantId: string): Promise<TenantOwnerLoginInfo> {
+export async function getTenantOwnerLoginInfo(
+  tenantOrId: string | TenantRecord
+): Promise<TenantOwnerLoginInfo> {
+  const tenantId = typeof tenantOrId === 'string' ? tenantOrId : tenantOrId.tenantId;
+  const tenantRecord = typeof tenantOrId === 'string' ? null : tenantOrId;
   const members = await listTenantMembers(tenantId);
   const owner = members.find((m) => m.role === 'owner');
-  if (!owner) {
-    return { created: false, role: 'business_owner' };
+  if (owner) {
+    return {
+      connected: true,
+      uid: owner.uid,
+      email: owner.email || tenantRecord?.ownerEmail,
+      role: 'owner',
+      addedAt: owner.addedAt,
+    };
+  }
+  if (tenantRecord?.ownerUid) {
+    return {
+      connected: true,
+      uid: tenantRecord.ownerUid,
+      email: tenantRecord.ownerEmail,
+      role: 'owner',
+    };
   }
   return {
-    created: true,
-    uid: owner.uid,
-    email: owner.email,
-    role: 'business_owner',
-    addedAt: owner.addedAt,
+    connected: false,
+    pendingEmail: tenantRecord?.ownerEmail ? tenantRecord.ownerEmail.trim().toLowerCase() : undefined,
+    role: 'owner',
   };
 }
 
 /**
- * Create a tenant-scoped Business Owner CRM login strictly through the trusted server endpoint
- * (/api/create-client-login). Never creates Firebase Auth users inside the browser session.
+ * Ensure a pending /ownerInvites/{emailHash} index record exists for a tenant that already
+ * has an approved ownerEmail but hasn't yet been claimed (e.g., legacy tenants created earlier).
+ * Restricted to verified Root Admin.
  */
-export async function createClientOwnerLogin(
-  input: CreateClientLoginInput
-): Promise<CreateClientLoginResult> {
-  const cleanTenant = (input.tenantId || '').trim().toLowerCase();
-  const cleanName = (input.clientName || '').trim();
-  const cleanEmail = (input.clientEmail || '').trim().toLowerCase();
-  const role = input.role ?? 'business_owner';
+export async function ensurePendingOwnerInvite(tenant: TenantRecord): Promise<void> {
+  const cleanTenant = (tenant.tenantId || '').trim().toLowerCase();
+  const cleanEmail = (tenant.ownerEmail || '').trim().toLowerCase();
+  if (!cleanTenant || !cleanEmail || cleanEmail === ROOT_ADMIN_EMAIL || tenant.ownerUid) {
+    return;
+  }
+
+  try {
+    const emailHash = await computeEmailHash(cleanEmail);
+    if (!emailHash) return;
+    const inviteRef = doc(db, 'ownerInvites', emailHash);
+    const snap = await getDoc(inviteRef);
+    if (!snap.exists()) {
+      const timestamp = new Date().toISOString();
+      await setDoc(inviteRef, {
+        emailHash,
+        ownerEmail: cleanEmail,
+        tenantId: cleanTenant,
+        businessName: tenant.businessName || cleanTenant,
+        status: 'pending',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+    }
+  } catch (err) {
+    console.warn(`Could not sync owner invite index for ${cleanTenant}:`, err);
+  }
+}
+
+/**
+ * Assign or update the approved Google owner email for an unclaimed tenant (Root Admin only).
+ * Atomically updates /tenants/{tenantId}.ownerEmail and /ownerInvites/{sha256(email)},
+ * retiring any previous pending owner invite and blocking overwrites of already-claimed tenants.
+ */
+export async function assignTenantOwnerEmail(
+  tenantId: string,
+  ownerEmail: string
+): Promise<{ success: boolean; ownerEmail?: string; error?: string }> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  const cleanEmail = (ownerEmail || '').trim().toLowerCase();
 
   if (!cleanTenant || !/^[a-z0-9_-]{1,128}$/.test(cleanTenant)) {
     return { success: false, error: 'A valid Tenant ID is required.' };
   }
-  if (cleanName.length < 2 || cleanName.length > 100) {
-    return { success: false, error: 'Client name must be between 2 and 100 characters.' };
-  }
   if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
-    return { success: false, error: 'A valid client email address is required.' };
+    return { success: false, error: 'Please enter a valid Google email address.' };
   }
   if (cleanEmail === ROOT_ADMIN_EMAIL) {
-    return { success: false, error: 'Root Administrator email cannot be assigned as a client login.' };
-  }
-  if (role !== 'business_owner') {
-    return { success: false, error: 'Invalid role. Client CRM logins are fixed to business_owner.' };
+    return { success: false, error: 'Root Administrator email cannot be assigned as a client owner.' };
   }
 
   const currentUser = auth.currentUser;
   if (!currentUser || !(await verifyRootAdminStatus(currentUser))) {
     return {
       success: false,
-      error: 'Action rejected: Only the verified Root Administrator may create client CRM logins.',
+      error: 'Action rejected: Only the verified Root Administrator may assign client owner emails.',
     };
   }
 
-  // Client-side pre-flight guard: verify tenant exists and is active without ever auto-activating
-  const tenantRec = await getTenantRecord(cleanTenant);
-  if (!tenantRec) {
-    return { success: false, error: `Tenant "${cleanTenant}" was not found.` };
-  }
-  if (tenantRec.status !== 'active') {
+  // Block reassigning if an owner member already exists
+  const existingMembers = await listTenantMembers(cleanTenant);
+  const connectedOwner = existingMembers.find((m) => m.role === 'owner');
+  if (connectedOwner) {
     return {
       success: false,
-      error: `Cannot create login: Tenant "${cleanTenant}" is suspended. Activate the client first.`,
+      error: `This tenant is already connected to owner "${connectedOwner.email || connectedOwner.uid}". Already-claimed tenants cannot be reassigned here.`,
     };
   }
 
   try {
-    const idToken = await currentUser.getIdToken();
-    const res = await fetch('/api/create-client-login', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${idToken}`,
-      },
-      body: JSON.stringify({
-        tenantId: cleanTenant,
-        clientName: cleanName,
-        clientEmail: cleanEmail,
-        role: 'business_owner',
-      }),
+    const newEmailHash = await computeEmailHash(cleanEmail);
+    const tenantRef = doc(db, 'tenants', cleanTenant);
+    const newInviteRef = doc(db, 'ownerInvites', newEmailHash);
+    const timestamp = new Date().toISOString();
+
+    await runTransaction(db, async (txn) => {
+      const [tenantSnap, newInviteSnap] = await Promise.all([
+        txn.get(tenantRef),
+        txn.get(newInviteRef),
+      ]);
+
+      if (!tenantSnap.exists()) {
+        throw new Error(`Tenant "${cleanTenant}" was not found.`);
+      }
+
+      const tenantData = tenantSnap.data();
+      if (tenantData.ownerUid) {
+        throw new Error(
+          `Tenant "${cleanTenant}" has already been claimed by an owner account and cannot be overwritten.`
+        );
+      }
+
+      if (newInviteSnap.exists()) {
+        const invData = newInviteSnap.data();
+        if (invData.tenantId !== cleanTenant && invData.status !== 'revoked') {
+          throw new Error(
+            `Email "${cleanEmail}" is already assigned to tenant "${invData.tenantId}". Each Google account can only be assigned as owner of one business.`
+          );
+        }
+        if (invData.tenantId === cleanTenant && invData.status === 'claimed') {
+          throw new Error(`Owner access has already been claimed for "${cleanEmail}".`);
+        }
+      }
+
+      const previousEmail = (tenantData.ownerEmail || '').trim().toLowerCase();
+      const oldEmailHash =
+        previousEmail && previousEmail !== cleanEmail
+          ? await computeEmailHash(previousEmail)
+          : '';
+      const oldInviteRef = oldEmailHash ? doc(db, 'ownerInvites', oldEmailHash) : null;
+      const oldInviteSnap = oldInviteRef ? await txn.get(oldInviteRef) : null;
+
+      if (oldInviteRef && oldInviteSnap && oldInviteSnap.exists()) {
+        const oldData = oldInviteSnap.data();
+        if (oldData.tenantId === cleanTenant) {
+          if (oldData.status === 'claimed') {
+            throw new Error(
+              `Previous owner "${previousEmail}" already claimed access and cannot be replaced.`
+            );
+          }
+          txn.delete(oldInviteRef);
+        }
+      }
+
+      txn.update(tenantRef, {
+        ownerEmail: cleanEmail,
+        updatedAt: timestamp,
+      });
+
+      const businessName = tenantData.name || tenantData.businessName || cleanTenant;
+      if (newInviteSnap.exists()) {
+        txn.update(newInviteRef, {
+          ownerEmail: cleanEmail,
+          businessName,
+          status: 'pending',
+          updatedAt: timestamp,
+        });
+      } else {
+        txn.set(newInviteRef, {
+          emailHash: newEmailHash,
+          ownerEmail: cleanEmail,
+          tenantId: cleanTenant,
+          businessName,
+          status: 'pending',
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        });
+      }
     });
 
-    const contentType = res.headers.get('content-type') || '';
-    if (!contentType.includes('application/json')) {
-      return {
-        success: false,
-        code: 'BACKEND_UNREACHABLE',
-        error:
-          'The secure login provisioning backend (/api/create-client-login) is unavailable in this environment. Deploy to Cloudflare Pages with FIREBASE_SERVICE_ACCOUNT_JSON and ROOT_ADMIN_UID configured.',
-      };
-    }
-
-    const data: any = await res.json().catch(() => null);
-    if (!res.ok || !data?.success) {
-      return {
-        success: false,
-        code: data?.code,
-        error: data?.message || `Failed to create client login (HTTP ${res.status}).`,
-      };
-    }
-
-    return {
-      success: true,
-      uid: data.uid,
-      tenantId: data.tenantId || cleanTenant,
-      clientName: data.clientName || cleanName,
-      clientEmail: data.clientEmail || cleanEmail,
-      role: 'business_owner',
-      setupLink: data.setupLink,
-      emailSent: Boolean(data.emailSent),
-    };
+    return { success: true, ownerEmail: cleanEmail };
   } catch (err: any) {
     return {
       success: false,
-      error:
-        err?.message ||
-        'Network error while contacting /api/create-client-login. Verify Cloudflare Pages deployment.',
+      error: err?.message || 'Failed to update approved owner Google email.',
     };
   }
 }

@@ -27,11 +27,12 @@ import {
   updateTenantSlugAtomic,
   updateTenantStatus,
   getTenantOwnerLoginInfo,
-  createClientOwnerLogin,
+  assignTenantOwnerEmail,
+  ensurePendingOwnerInvite,
   TenantOwnerLoginInfo,
-  CreateClientLoginResult,
   validateAndNormalizeSlug,
   verifyRootAdminStatus,
+  ROOT_ADMIN_EMAIL,
 } from '../auth/clientAuth';
 import { auth } from '../firebase';
 import { TenantRecord, TenantStatus } from '../types';
@@ -95,16 +96,16 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
   const [suspendConfirmTenant, setSuspendConfirmTenant] = useState<TenantRecord | null>(null);
   const [actionErrorBanner, setActionErrorBanner] = useState<string | null>(null);
 
-  // Client CRM Login Status & Creation Modal State (Root Admin only)
+  // Client CRM Owner Google Email Assignment Modal State (Root Admin only)
   const [ownerLoginsByTenant, setOwnerLoginsByTenant] = useState<Record<string, TenantOwnerLoginInfo>>({});
-  const [loginModalTenant, setLoginModalTenant] = useState<TenantRecord | null>(null);
-  const [loginClientName, setLoginClientName] = useState<string>('');
-  const [loginClientEmail, setLoginClientEmail] = useState<string>('');
-  const [loginModalStep, setLoginModalStep] = useState<'form' | 'confirm' | 'result'>('form');
-  const [loginModalError, setLoginModalError] = useState<string | null>(null);
-  const [isCreatingLogin, setIsCreatingLogin] = useState<boolean>(false);
-  const [createdLoginResult, setCreatedLoginResult] = useState<CreateClientLoginResult | null>(null);
-  const [copiedSetupLink, setCopiedSetupLink] = useState<boolean>(false);
+  const [ownerModalTenant, setOwnerModalTenant] = useState<TenantRecord | null>(null);
+  const [ownerEmailInput, setOwnerEmailInput] = useState<string>('');
+  const [ownerModalError, setOwnerModalError] = useState<string | null>(null);
+  const [isSavingOwnerEmail, setIsSavingOwnerEmail] = useState<boolean>(false);
+  const [copiedCrmLink, setCopiedCrmLink] = useState<boolean>(false);
+
+  const commonCrmUrl =
+    typeof window !== 'undefined' ? `${window.location.origin}/crm` : '/crm';
 
   // Available industry preset keys with human-readable labels
   const availableIndustries = Object.keys(INDUSTRY_PRESETS).map((key) => ({
@@ -119,7 +120,13 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
       const records = await listTenantRecords();
       setTenants(records);
       const loginEntries = await Promise.all(
-        records.map(async (t) => [t.tenantId, await getTenantOwnerLoginInfo(t.tenantId)] as const)
+        records.map(async (t) => {
+          const info = await getTenantOwnerLoginInfo(t);
+          if (!info.connected && t.ownerEmail && !t.ownerUid) {
+            await ensurePendingOwnerInvite(t);
+          }
+          return [t.tenantId, info] as const;
+        })
       );
       setOwnerLoginsByTenant(Object.fromEntries(loginEntries));
       return records;
@@ -262,102 +269,62 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
     }
   };
 
-  const handleOpenCreateLoginModal = (tenant: TenantRecord) => {
-    setLoginModalTenant(tenant);
-    setLoginClientName(tenant.businessName || '');
-    setLoginClientEmail(tenant.ownerEmail || '');
-    setLoginModalStep('form');
-    setLoginModalError(null);
-    setCreatedLoginResult(null);
-    setCopiedSetupLink(false);
+  const handleOpenOwnerEmailModal = (tenant: TenantRecord) => {
+    setOwnerModalTenant(tenant);
+    setOwnerEmailInput(tenant.ownerEmail || '');
+    setOwnerModalError(null);
   };
 
-  const handleCloseCreateLoginModal = () => {
-    if (isCreatingLogin) return;
-    setLoginModalTenant(null);
-    setLoginModalError(null);
-    setCreatedLoginResult(null);
-    setCopiedSetupLink(false);
+  const handleCloseOwnerEmailModal = () => {
+    if (isSavingOwnerEmail) return;
+    setOwnerModalTenant(null);
+    setOwnerModalError(null);
   };
 
-  const handleReviewCreateLogin = (e: React.FormEvent) => {
+  const handleSaveOwnerEmail = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!loginModalTenant) return;
-    setLoginModalError(null);
+    if (!ownerModalTenant || isSavingOwnerEmail) return;
+    setOwnerModalError(null);
 
-    if (loginModalTenant.status !== 'active') {
-      setLoginModalError(
-        `Cannot create login: Tenant "${loginModalTenant.tenantId}" is suspended. Activate the tenant first.`
-      );
-      return;
-    }
-
-    const cleanName = loginClientName.trim();
-    const cleanEmail = loginClientEmail.trim().toLowerCase();
-
-    if (cleanName.length < 2 || cleanName.length > 100) {
-      setLoginModalError('Client name must be between 2 and 100 characters.');
-      return;
-    }
+    const cleanEmail = ownerEmailInput.trim().toLowerCase();
     if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
-      setLoginModalError('Please enter a valid client email address.');
+      setOwnerModalError('Please enter a valid Google email address.');
+      return;
+    }
+    if (cleanEmail === ROOT_ADMIN_EMAIL) {
+      setOwnerModalError('Root Administrator email cannot be assigned as a client owner.');
       return;
     }
 
-    setLoginModalStep('confirm');
-  };
-
-  const handleConfirmCreateLogin = async () => {
-    if (!loginModalTenant || isCreatingLogin) return;
-    setLoginModalError(null);
-    setIsCreatingLogin(true);
-
+    setIsSavingOwnerEmail(true);
     try {
-      const res = await createClientOwnerLogin({
-        tenantId: loginModalTenant.tenantId,
-        clientName: loginClientName.trim(),
-        clientEmail: loginClientEmail.trim().toLowerCase(),
-        role: 'business_owner',
-      });
-
+      const res = await assignTenantOwnerEmail(ownerModalTenant.tenantId, cleanEmail);
       if (!res.success) {
-        setLoginModalError(res.error || 'Failed to create client CRM login.');
+        setOwnerModalError(res.error || 'Failed to save approved Google owner email.');
         return;
       }
 
-      setCreatedLoginResult(res);
-      setLoginModalStep('result');
-      setOwnerLoginsByTenant((prev) => ({
-        ...prev,
-        [loginModalTenant.tenantId]: {
-          created: true,
-          uid: res.uid,
-          email: res.clientEmail,
-          role: 'business_owner',
-          addedAt: new Date().toISOString(),
-        },
-      }));
+      const savedBusiness = ownerModalTenant.businessName;
+      setOwnerModalTenant(null);
       setSuccessBanner(
-        `Client CRM login created for "${loginModalTenant.businessName}" (${res.clientEmail}).`
+        `Approved Google owner email set to "${cleanEmail}" for "${savedBusiness}". Share ${commonCrmUrl} so they can sign in with Google.`
       );
-      setTimeout(() => setSuccessBanner(null), 6000);
+      setTimeout(() => setSuccessBanner(null), 7000);
       await fetchTenants();
     } catch (err: any) {
-      setLoginModalError(err?.message || 'Unexpected error while creating client CRM login.');
+      setOwnerModalError(err?.message || 'Unexpected error while saving owner Google email.');
     } finally {
-      setIsCreatingLogin(false);
+      setIsSavingOwnerEmail(false);
     }
   };
 
-  const handleCopySetupLink = async () => {
-    const link = createdLoginResult?.setupLink;
-    if (!link) return;
+  const handleCopyCrmLink = async () => {
     try {
-      await navigator.clipboard.writeText(link);
-      setCopiedSetupLink(true);
-      setTimeout(() => setCopiedSetupLink(false), 3000);
+      await navigator.clipboard.writeText(commonCrmUrl);
+      setCopiedCrmLink(true);
+      setTimeout(() => setCopiedCrmLink(false), 3000);
     } catch {
-      setCopiedSetupLink(false);
+      setCopiedCrmLink(false);
     }
   };
 
@@ -556,6 +523,26 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
           </div>
 
           <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
+            {/* Copy Common CRM Link Button */}
+            <button
+              type="button"
+              onClick={handleCopyCrmLink}
+              className="flex items-center gap-2 bg-blue-600/20 hover:bg-blue-600/30 text-blue-200 border border-blue-500/40 px-3.5 py-2 rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
+              title={`Copy shared CRM Sign-In URL (${commonCrmUrl})`}
+            >
+              {copiedCrmLink ? (
+                <>
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>CRM Link Copied</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3.5 h-3.5 text-blue-300" />
+                  <span>Copy CRM Link</span>
+                </>
+              )}
+            </button>
+
             {/* Add New Client Button */}
             <button
               onClick={handleOpenAddModal}
@@ -767,11 +754,11 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
 
                         {/* Client CRM Login Status */}
                         <td className="px-5 py-4">
-                          {ownerLogin?.created ? (
+                          {ownerLogin?.connected ? (
                             <div className="space-y-1">
                               <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
                                 <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                                Created
+                                Connected
                               </span>
                               {ownerLogin.email && (
                                 <div className="text-[11px] text-slate-200 font-medium break-all">
@@ -779,12 +766,24 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                                 </div>
                               )}
                               <div className="text-[10px] font-mono text-sky-300">
-                                Role: business_owner
+                                Role: owner
+                              </div>
+                            </div>
+                          ) : ownerLogin?.pendingEmail ? (
+                            <div className="space-y-1">
+                              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-amber-500/10 text-amber-300 border border-amber-500/30">
+                                Not Connected
+                              </span>
+                              <div className="text-[11px] text-slate-300 break-all">
+                                Invited: {ownerLogin.pendingEmail}
+                              </div>
+                              <div className="text-[10px] font-mono text-slate-400">
+                                Awaiting Google Sign-In
                               </div>
                             </div>
                           ) : (
                             <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-slate-800 text-slate-400 border border-slate-700">
-                              Not Created
+                              Not Connected
                             </span>
                           )}
                         </td>
@@ -821,21 +820,16 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                         {/* Action Buttons */}
                         <td className="px-5 py-4 text-right">
                           <div className="flex items-center justify-end gap-2 flex-wrap">
-                            {/* Create Client Login Button (Root Admin only) */}
-                            {verifiedRootAdmin && !ownerLogin?.created && (
+                            {/* Assign / Edit Owner Google Email Button (Root Admin only) */}
+                            {verifiedRootAdmin && !ownerLogin?.connected && (
                               <button
                                 type="button"
-                                disabled={!isActive}
-                                onClick={() => handleOpenCreateLoginModal(tenant)}
-                                className="px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/40 flex items-center gap-1.5 shadow-sm disabled:opacity-40 disabled:cursor-not-allowed"
-                                title={
-                                  isActive
-                                    ? 'Create Business Owner CRM login for this client'
-                                    : 'Activate this client before creating a CRM login'
-                                }
+                                onClick={() => handleOpenOwnerEmailModal(tenant)}
+                                className="px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/40 flex items-center gap-1.5 shadow-sm"
+                                title="Set or update the approved Google email for this business owner"
                               >
                                 <KeyRound className="w-3.5 h-3.5 text-blue-300" />
-                                <span>Create Client Login</span>
+                                <span>{tenant.ownerEmail ? 'Edit Owner Email' : 'Set Owner Email'}</span>
                               </button>
                             )}
 
@@ -986,39 +980,45 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                       <span className="text-[10px] uppercase font-bold text-slate-500">
                         Client CRM Login
                       </span>
-                      {ownerLogin?.created ? (
+                      {ownerLogin?.connected ? (
                         <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
-                          Created
+                          Connected
                         </span>
                       ) : (
                         <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-800 text-slate-400 border border-slate-700">
-                          Not Created
+                          Not Connected
                         </span>
                       )}
                     </div>
-                    {ownerLogin?.created && (
+                    {ownerLogin?.connected ? (
                       <div className="pt-1 space-y-0.5">
                         {ownerLogin.email && (
                           <div className="text-slate-200 font-medium break-all">{ownerLogin.email}</div>
                         )}
-                        <div className="text-[11px] font-mono text-sky-300">Role: business_owner</div>
+                        <div className="text-[11px] font-mono text-sky-300">Role: owner</div>
                       </div>
-                    )}
+                    ) : ownerLogin?.pendingEmail ? (
+                      <div className="pt-1 space-y-0.5">
+                        <div className="text-slate-300 break-all">
+                          Invited: {ownerLogin.pendingEmail}
+                        </div>
+                        <div className="text-[11px] font-mono text-slate-400">
+                          Awaiting Google Sign-In
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
 
                   <div className="pt-2 flex flex-col gap-2">
-                    {/* Create Client Login Button (Root Admin only) */}
-                    {verifiedRootAdmin && !ownerLogin?.created && (
+                    {/* Assign / Edit Owner Google Email Button (Root Admin only) */}
+                    {verifiedRootAdmin && !ownerLogin?.connected && (
                       <button
                         type="button"
-                        disabled={!isActive}
-                        onClick={() => handleOpenCreateLoginModal(tenant)}
-                        className="w-full py-2 rounded-xl text-xs font-bold transition cursor-pointer flex items-center justify-center gap-1.5 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/40 disabled:opacity-40 disabled:cursor-not-allowed"
+                        onClick={() => handleOpenOwnerEmailModal(tenant)}
+                        className="w-full py-2 rounded-xl text-xs font-bold transition cursor-pointer flex items-center justify-center gap-1.5 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/40"
                       >
                         <KeyRound className="w-3.5 h-3.5 text-blue-300" />
-                        <span>
-                          {isActive ? 'Create Client Login' : 'Create Client Login (Activate First)'}
-                        </span>
+                        <span>{tenant.ownerEmail ? 'Edit Owner Email' : 'Set Owner Email'}</span>
                       </button>
                     )}
 
@@ -1238,21 +1238,21 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                 </select>
               </div>
 
-              {/* Owner Email (Optional) */}
+              {/* Owner Google Email (Optional) */}
               <div>
                 <label className="block text-slate-300 font-bold mb-1">
-                  Owner Email <span className="text-slate-500 font-normal">(Optional)</span>
+                  Approved Owner Google Email <span className="text-slate-500 font-normal">(Optional)</span>
                 </label>
                 <input
                   type="email"
-                  placeholder="e.g. owner@apexdental.com"
+                  placeholder="e.g. owner@gmail.com"
                   value={formOwnerEmail}
                   onChange={(e) => setFormOwnerEmail(e.target.value)}
                   className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none transition"
                   disabled={isSubmitting}
                 />
                 <p className="text-[11px] text-slate-500 mt-1">
-                  Initial primary contact email for tenant administrative records.
+                  When set, signing into <span className="font-mono text-sky-300">/crm</span> with this verified Google account connects the owner directly to this tenant.
                 </p>
               </div>
 
@@ -1436,8 +1436,8 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
         </div>
       )}
 
-      {/* Create Client Login Modal (Root Admin only) */}
-      {verifiedRootAdmin && loginModalTenant && (
+      {/* Set / Edit Approved Owner Google Email Modal (Root Admin only) */}
+      {verifiedRootAdmin && ownerModalTenant && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in">
           <div className="relative w-full max-w-lg max-h-[90vh] overflow-y-auto bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 text-slate-100">
             <div className="flex items-center justify-between pb-4 border-b border-slate-800 mb-4">
@@ -1446,233 +1446,132 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                   <UserPlus className="w-5 h-5" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-extrabold text-white">Create Client CRM Login</h3>
-                  <p className="text-xs text-slate-400">{loginModalTenant.businessName}</p>
+                  <h3 className="text-sm font-extrabold text-white">
+                    {ownerModalTenant.ownerEmail ? 'Edit Approved Owner Google Email' : 'Assign Approved Owner Google Email'}
+                  </h3>
+                  <p className="text-xs text-slate-400">{ownerModalTenant.businessName}</p>
                 </div>
               </div>
               <button
                 type="button"
-                onClick={handleCloseCreateLoginModal}
-                disabled={isCreatingLogin}
+                onClick={handleCloseOwnerEmailModal}
+                disabled={isSavingOwnerEmail}
                 className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {loginModalError && (
+            {ownerModalError && (
               <div className="mb-4 p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-start gap-2">
                 <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-                <span>{loginModalError}</span>
+                <span>{ownerModalError}</span>
               </div>
             )}
 
-            {loginModalStep === 'form' && (
-              <form onSubmit={handleReviewCreateLogin} className="space-y-4 text-xs">
+            <form onSubmit={handleSaveOwnerEmail} className="space-y-4 text-xs">
+              <div>
+                <label className="block text-slate-300 font-bold mb-1">
+                  Approved Owner Google Email <span className="text-rose-400">*</span>
+                </label>
+                <input
+                  type="email"
+                  required
+                  value={ownerEmailInput}
+                  onChange={(e) => setOwnerEmailInput(e.target.value)}
+                  placeholder="e.g. clientowner@gmail.com"
+                  className="w-full bg-slate-950 border border-slate-700 focus:border-blue-500 rounded-xl px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none transition"
+                  disabled={isSavingOwnerEmail}
+                />
+                <p className="text-[11px] text-slate-400 mt-1.5">
+                  The business owner must sign in via Google using this exact verified email address.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-slate-300 font-bold mb-1">
-                    Client Name <span className="text-rose-400">*</span>
+                    Tenant ID (Read-only)
                   </label>
                   <input
                     type="text"
-                    required
-                    value={loginClientName}
-                    onChange={(e) => setLoginClientName(e.target.value)}
-                    placeholder="e.g. Rajesh Nair"
-                    className="w-full bg-slate-950 border border-slate-700 focus:border-blue-500 rounded-xl px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none transition"
+                    readOnly
+                    value={ownerModalTenant.tenantId}
+                    className="w-full bg-slate-950/60 border border-slate-800 rounded-xl px-3.5 py-2.5 text-emerald-400 font-mono cursor-not-allowed focus:outline-none"
                   />
                 </div>
-
                 <div>
                   <label className="block text-slate-300 font-bold mb-1">
-                    Client Email <span className="text-rose-400">*</span>
+                    Role Assigned on Sign-In
                   </label>
                   <input
-                    type="email"
-                    required
-                    value={loginClientEmail}
-                    onChange={(e) => setLoginClientEmail(e.target.value)}
-                    placeholder="e.g. owner@business.com"
-                    className="w-full bg-slate-950 border border-slate-700 focus:border-blue-500 rounded-xl px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none transition"
+                    type="text"
+                    readOnly
+                    value="owner"
+                    className="w-full bg-slate-950/60 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sky-300 font-mono cursor-not-allowed focus:outline-none"
                   />
                 </div>
+              </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-slate-300 font-bold mb-1">
-                      Tenant ID (Read-only)
-                    </label>
-                    <input
-                      type="text"
-                      readOnly
-                      value={loginModalTenant.tenantId}
-                      className="w-full bg-slate-950/60 border border-slate-800 rounded-xl px-3.5 py-2.5 text-emerald-400 font-mono cursor-not-allowed focus:outline-none"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-slate-300 font-bold mb-1">
-                      Role (Fixed)
-                    </label>
-                    <input
-                      type="text"
-                      readOnly
-                      value="business_owner"
-                      className="w-full bg-slate-950/60 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sky-300 font-mono cursor-not-allowed focus:outline-none"
-                    />
-                  </div>
-                </div>
-
-                <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-3 text-[11px] text-slate-400 leading-relaxed">
-                  No password is entered or stored. The server creates the Firebase Authentication
-                  account scoped exclusively to{' '}
-                  <span className="font-mono text-emerald-400">{loginModalTenant.tenantId}</span> and
-                  generates a one-time password setup link for the client.
-                </div>
-
-                <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
+              <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-3 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-bold text-slate-300">Common CRM Sign-In Link</span>
                   <button
                     type="button"
-                    onClick={handleCloseCreateLoginModal}
-                    className="px-4 py-2 rounded-xl text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 font-bold text-xs transition cursor-pointer"
+                    onClick={handleCopyCrmLink}
+                    className="px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold text-[11px] flex items-center gap-1 transition cursor-pointer"
                   >
-                    Cancel
-                  </button>
-                  <button
-                    type="submit"
-                    className="flex items-center gap-2 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs transition shadow-md cursor-pointer"
-                  >
-                    <span>Review & Continue</span>
+                    {copiedCrmLink ? (
+                      <>
+                        <Check className="w-3 h-3" />
+                        <span>Copied</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3 h-3" />
+                        <span>Copy Link</span>
+                      </>
+                    )}
                   </button>
                 </div>
-              </form>
-            )}
-
-            {loginModalStep === 'confirm' && (
-              <div className="space-y-4 text-xs">
-                <p className="text-slate-300">
-                  Confirm creating a dedicated Business Owner CRM login with the details below:
-                </p>
-
-                <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 space-y-2">
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-slate-400">Client Name</span>
-                    <span className="font-bold text-white">{loginClientName.trim()}</span>
-                  </div>
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-slate-400">Client Email</span>
-                    <span className="font-bold text-white break-all">
-                      {loginClientEmail.trim().toLowerCase()}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-slate-400">Tenant ID</span>
-                    <span className="font-mono text-emerald-400">{loginModalTenant.tenantId}</span>
-                  </div>
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-slate-400">Role</span>
-                    <span className="font-mono text-sky-300">business_owner</span>
-                  </div>
-                </div>
-
+                <input
+                  type="text"
+                  readOnly
+                  value={commonCrmUrl}
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-[11px] font-mono text-sky-300 focus:outline-none"
+                />
                 <p className="text-[11px] text-slate-400 leading-relaxed">
-                  This user will only access CRM leads and team management for{' '}
-                  <span className="font-mono text-emerald-400">{loginModalTenant.tenantId}</span> and
-                  cannot access other tenants or Root Admin tools.
+                  Share this link with the client. On their first Google Sign-In, Firebase creates their account automatically and Firestore Security Rules verify their email before linking them as owner of{' '}
+                  <span className="font-mono text-emerald-400">{ownerModalTenant.tenantId}</span>.
                 </p>
-
-                <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
-                  <button
-                    type="button"
-                    onClick={() => setLoginModalStep('form')}
-                    disabled={isCreatingLogin}
-                    className="px-4 py-2 rounded-xl text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 font-bold text-xs transition cursor-pointer"
-                  >
-                    Back
-                  </button>
-                  <button
-                    type="button"
-                    disabled={isCreatingLogin}
-                    onClick={handleConfirmCreateLogin}
-                    className="flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs transition shadow-md cursor-pointer"
-                  >
-                    {isCreatingLogin && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
-                    <span>{isCreatingLogin ? 'Creating Login...' : 'Confirm & Create Login'}</span>
-                  </button>
-                </div>
               </div>
-            )}
 
-            {loginModalStep === 'result' && createdLoginResult && (
-              <div className="space-y-4 text-xs">
-                <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-200 flex items-start gap-2.5">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-                  <div>
-                    <p className="font-bold">Client CRM Login Created</p>
-                    <p className="text-emerald-300/90 mt-0.5">
-                      Email <span className="font-semibold">{createdLoginResult.clientEmail}</span>{' '}
-                      has been provisioned with role{' '}
-                      <span className="font-mono">business_owner</span> for{' '}
-                      <span className="font-mono">{createdLoginResult.tenantId}</span>.
-                    </p>
-                  </div>
+              {ownerModalTenant.status !== 'active' && (
+                <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-[11px]">
+                  Note: This client is currently <strong>Suspended</strong>. They will not be able to sign in or claim owner access until you activate their account.
                 </div>
+              )}
 
-                {createdLoginResult.setupLink && (
-                  <div className="space-y-2">
-                    <label className="block text-slate-300 font-bold">
-                      One-Time Password Setup Link
-                    </label>
-                    <div className="flex flex-col sm:flex-row gap-2">
-                      <input
-                        type="text"
-                        readOnly
-                        value={createdLoginResult.setupLink}
-                        onFocus={(e) => e.currentTarget.select()}
-                        className="flex-1 bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-[11px] font-mono text-sky-300 focus:outline-none"
-                      />
-                      <button
-                        type="button"
-                        onClick={handleCopySetupLink}
-                        className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer shrink-0"
-                      >
-                        {copiedSetupLink ? (
-                          <>
-                            <Check className="w-3.5 h-3.5" />
-                            <span>Copied</span>
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="w-3.5 h-3.5" />
-                            <span>Copy Link</span>
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 text-[11px] text-amber-200 leading-relaxed space-y-1">
-                  <p className="font-bold text-amber-300">How to share this link securely:</p>
-                  <p>
-                    No automatic email was sent because no outbound email service is configured.
-                    Copy this link and send it directly to the business owner via private message
-                    (e.g., WhatsApp or direct email). Once they open the link and set their own
-                    password, they can sign in to the CRM with{' '}
-                    <span className="font-mono">{createdLoginResult.clientEmail}</span>.
-                  </p>
-                </div>
-
-                <div className="flex justify-end pt-3 border-t border-slate-800">
-                  <button
-                    type="button"
-                    onClick={handleCloseCreateLoginModal}
-                    className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs transition cursor-pointer"
-                  >
-                    Done
-                  </button>
-                </div>
+              <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={handleCloseOwnerEmailModal}
+                  disabled={isSavingOwnerEmail}
+                  className="px-4 py-2 rounded-xl text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 font-bold text-xs transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingOwnerEmail}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs transition shadow-md cursor-pointer"
+                >
+                  {isSavingOwnerEmail && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                  <span>{isSavingOwnerEmail ? 'Saving...' : 'Save Owner Email'}</span>
+                </button>
               </div>
-            )}
+            </form>
           </div>
         </div>
       )}

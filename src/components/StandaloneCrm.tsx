@@ -12,6 +12,9 @@ import {
   fetchPublicWebsiteConfig,
   fetchTenantWebsiteDraft,
   listTenantRecords,
+  getTenantRecord,
+  getLastGoogleOnboardingError,
+  clearLastGoogleOnboardingError,
 } from '../auth/clientAuth';
 import { auth } from '../firebase';
 import { LeadPilotDashboard } from './LeadPilotDashboard';
@@ -47,6 +50,8 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
     config: Partial<ClientConfig>;
   } | null>(null);
   const [adminTenantList, setAdminTenantList] = useState<TenantRecord[]>([]);
+  const [onboardingError, setOnboardingError] = useState<string | null>(() => getLastGoogleOnboardingError());
+  const [tenantAccessState, setTenantAccessState] = useState<'checking' | 'active' | 'blocked'>('checking');
 
   // URL Invitation parameters
   const [pendingInvite, setPendingInvite] = useState<{ tenantId: string; hash: string } | null>(() => {
@@ -73,12 +78,14 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
         setIsRootAdmin(caps.isRootAdmin);
         if (caps.isAdmin) {
           setAdminSelectedTenant((prev) => prev || user.clientId || defaultClientId);
+          setTenantAccessState('active');
         } else {
           setAdminSelectedTenant('');
         }
         if (!caps.isRootAdmin) {
           setAdminViewMode('crm');
         }
+        setOnboardingError(getLastGoogleOnboardingError());
         setCurrentUser(user);
         setIsAuthResolving(false);
       } else {
@@ -87,6 +94,8 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
         setIsRootAdmin(false);
         setAdminViewMode('crm');
         setAdminSelectedTenant('');
+        setOnboardingError(null);
+        setTenantAccessState('checking');
         setCurrentUser(null);
         setIsAuthResolving(false);
       }
@@ -96,6 +105,43 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
       unsubscribe();
     };
   }, [defaultClientId]);
+
+  // Verify non-admin tenant membership & active account status on load
+  useEffect(() => {
+    if (!currentUser) {
+      setTenantAccessState('checking');
+      return;
+    }
+    if (isVerifiedAdmin) {
+      setTenantAccessState('active');
+      return;
+    }
+    if (!currentUser.clientId) {
+      setTenantAccessState('blocked');
+      return;
+    }
+
+    let isCancelled = false;
+    setTenantAccessState('checking');
+    getTenantRecord(currentUser.clientId)
+      .then((rec) => {
+        if (isCancelled) return;
+        if (rec && rec.status === 'active') {
+          setTenantAccessState('active');
+        } else {
+          setTenantAccessState('blocked');
+        }
+      })
+      .catch(() => {
+        if (!isCancelled) {
+          setTenantAccessState('blocked');
+        }
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [currentUser?.userId, currentUser?.clientId, isVerifiedAdmin]);
 
   // Safe migration of existing local records when authenticated
   useEffect(() => {
@@ -201,6 +247,8 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
 
   const handleGoogleLogin = async () => {
     setLoginError('');
+    setOnboardingError(null);
+    clearLastGoogleOnboardingError();
     setIsSubmitting(true);
     try {
       const res = await loginWithGoogle();
@@ -210,11 +258,15 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
         setIsRootAdmin(caps.isRootAdmin);
         if (caps.isAdmin) {
           setAdminSelectedTenant((prev) => prev || res.user!.clientId || defaultClientId);
+          setTenantAccessState('active');
         } else {
           setAdminSelectedTenant('');
         }
         if (!caps.isRootAdmin) {
           setAdminViewMode('crm');
+        }
+        if (!res.user.clientId && res.error) {
+          setOnboardingError(res.error);
         }
         setCurrentUser(res.user);
         setIsAuthResolving(false);
@@ -229,11 +281,14 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
   };
 
   const handleLogout = async () => {
+    clearLastGoogleOnboardingError();
     await logoutClient();
     setIsVerifiedAdmin(false);
     setIsRootAdmin(false);
     setAdminViewMode('crm');
     setAdminSelectedTenant('');
+    setOnboardingError(null);
+    setTenantAccessState('checking');
     setCurrentUser(null);
     setIsAuthResolving(false);
   };
@@ -427,7 +482,7 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
               type="button"
               onClick={handleGoogleLogin}
               disabled={isSubmitting}
-              className="w-full py-2.5 px-4 mb-4 bg-white hover:bg-slate-100 text-slate-800 font-bold rounded-xl shadow transition flex items-center justify-center gap-3 cursor-pointer text-sm disabled:opacity-50"
+              className="w-full py-2.5 px-4 mb-2 bg-white hover:bg-slate-100 text-slate-800 font-bold rounded-xl shadow transition flex items-center justify-center gap-3 cursor-pointer text-sm disabled:opacity-50"
             >
               <svg className="w-4 h-4" viewBox="0 0 24 24">
                 <path
@@ -447,8 +502,11 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
                   d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"
                 />
               </svg>
-              <span>Continue with Google</span>
+              <span>Sign in with Google</span>
             </button>
+            <p className="text-[11px] text-slate-400 text-center mb-4">
+              Business owners: Sign in with your approved Google account to connect automatically.
+            </p>
 
             <div className="flex items-center my-4">
               <div className="flex-grow border-t border-slate-800"></div>
@@ -522,17 +580,55 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
     );
   }
 
-  // If authenticated but no tenant membership is assigned (and not verified Root Admin), block access to leads
+  // If authenticated without an assigned tenant (and not verified Root Admin), block access cleanly
   if (!currentUser.clientId && !isVerifiedAdmin) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center items-center p-4">
+        <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 shadow-2xl text-center">
+          <div className="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-rose-500/20 text-rose-400 mb-4 border border-rose-500/30">
+            <AlertCircle className="w-6 h-6" />
+          </div>
+          <h2 className="text-xl font-bold text-white mb-2">CRM Access Denied</h2>
+          <p className="text-xs text-slate-300 mb-3 leading-relaxed">
+            {onboardingError ||
+              `Signed in as ${currentUser.email}. Your Google account does not have an active business tenant assignment. Access to customer leads is restricted.`}
+          </p>
+          <p className="text-[11px] text-slate-500 mb-6">
+            Signed in as <strong className="text-slate-300">{currentUser.email}</strong>. Ask your LeadPilot administrator to approve your Google email for your business before trying again.
+          </p>
+          <button
+            onClick={handleLogout}
+            className="w-full py-2.5 px-4 bg-slate-800 hover:bg-slate-700 text-white font-bold rounded-xl text-xs transition cursor-pointer"
+          >
+            Sign Out & Try Another Account
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Wait for tenant active verification for non-admin users
+  if (!isVerifiedAdmin && tenantAccessState === 'checking') {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-300 flex flex-col justify-center items-center p-4">
+        <RefreshCw className="w-7 h-7 text-blue-400 animate-spin mb-3" />
+        <p className="text-sm font-medium">Checking business account status...</p>
+      </div>
+    );
+  }
+
+  // Block access cleanly if assigned tenant is suspended or membership is inactive
+  if (!isVerifiedAdmin && tenantAccessState === 'blocked') {
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center items-center p-4">
         <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 shadow-2xl text-center">
           <div className="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-amber-500/20 text-amber-400 mb-4 border border-amber-500/30">
             <AlertCircle className="w-6 h-6" />
           </div>
-          <h2 className="text-xl font-bold text-white mb-2">No Tenant Membership Assigned</h2>
-          <p className="text-xs text-slate-400 mb-6">
-            Signed in as <strong className="text-slate-200">{currentUser.email}</strong>. Your account does not have an active business tenant assignment. Access to customer leads is restricted.
+          <h2 className="text-xl font-bold text-white mb-2">Business Account Inactive or Suspended</h2>
+          <p className="text-xs text-slate-400 mb-6 leading-relaxed">
+            Signed in as <strong className="text-slate-200">{currentUser.email}</strong>. CRM access for{' '}
+            <span className="font-mono text-amber-300">{currentUser.clientId}</span> is currently unavailable because the business account is suspended or your membership is inactive.
           </p>
           <button
             onClick={handleLogout}

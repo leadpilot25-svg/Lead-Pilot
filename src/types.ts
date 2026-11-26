@@ -97,6 +97,7 @@ export interface TenantRecord {
   status: TenantStatus;
   isPublished: boolean;
   ownerEmail?: string;
+  ownerUid?: string;
   createdAt: string;
   updatedAt?: string;
   slug?: string;

@@ -18,6 +18,13 @@ service cloud.firestore {
       return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_-]+$');
     }
 
+    function isGoogleVerifiedUser() {
+      return isSignedIn() &&
+        request.auth.token.email is string &&
+        request.auth.token.email_verified == true &&
+        request.auth.token.firebase.sign_in_provider == 'google.com';
+    }
+
     // Root platform administrator: cryptographically verified Google identity
     function isRootAdmin() {
       return isSignedIn() &&
@@ -158,7 +165,7 @@ service cloud.firestore {
       allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
       allow list: if isAdmin();
 
-      // Ordinary users can only create unassigned profiles; assigning roles or tenants requires isAdmin()
+      // Ordinary users can only create unassigned profiles OR atomically claim an active tenant where their verified Google email is the approved ownerEmail
       allow create: if isSignedIn() && isValidUserProfile(request.resource.data) && (
         isAdmin() ||
         (
@@ -166,11 +173,28 @@ service cloud.firestore {
           request.resource.data.uid == userId &&
           (!('role' in request.resource.data) || request.resource.data.role == 'unassigned') &&
           (!('tenantId' in request.resource.data) || request.resource.data.tenantId == '' || request.resource.data.tenantId == null)
+        ) ||
+        (
+          isGoogleVerifiedUser() &&
+          request.auth.uid == userId &&
+          request.resource.data.uid == userId &&
+          request.resource.data.email.lower() == request.auth.token.email.lower() &&
+          request.resource.data.role == 'owner' &&
+          isValidId(request.resource.data.tenantId) &&
+          isTenantActive(request.resource.data.tenantId) &&
+          'ownerEmail' in get(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)).data &&
+          get(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)).data.ownerEmail is string &&
+          get(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)).data.ownerEmail.lower() == request.auth.token.email.lower() &&
+          (
+            !('ownerUid' in get(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)).data) ||
+            get(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)).data.ownerUid == '' ||
+            get(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)).data.ownerUid == null
+          ) &&
+          getAfter(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)/members/$(userId)).data.role == 'owner'
         )
       );
 
-      // Ordinary users can update basic profile info, but role and tenantId are completely immutable
-      // (Safely accommodates missing/optional role or tenantId on existing legacy profiles)
+      // Ordinary users can update basic profile info (with immutable role/tenantId), OR transition from unassigned -> owner via atomic Google owner claim
       allow update: if isSignedIn() && isValidUserProfile(request.resource.data) && (
         isAdmin() ||
         (
@@ -179,6 +203,26 @@ service cloud.firestore {
           request.resource.data.email == resource.data.email &&
           (!('role' in resource.data) || request.resource.data.role == resource.data.role) &&
           (!('tenantId' in resource.data) || request.resource.data.tenantId == resource.data.tenantId)
+        ) ||
+        (
+          isGoogleVerifiedUser() &&
+          request.auth.uid == userId &&
+          request.resource.data.uid == resource.data.uid &&
+          request.resource.data.email.lower() == request.auth.token.email.lower() &&
+          (!('role' in resource.data) || resource.data.role == 'unassigned') &&
+          (!('tenantId' in resource.data) || resource.data.tenantId == '' || resource.data.tenantId == null) &&
+          request.resource.data.role == 'owner' &&
+          isValidId(request.resource.data.tenantId) &&
+          isTenantActive(request.resource.data.tenantId) &&
+          'ownerEmail' in get(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)).data &&
+          get(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)).data.ownerEmail is string &&
+          get(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)).data.ownerEmail.lower() == request.auth.token.email.lower() &&
+          (
+            !('ownerUid' in get(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)).data) ||
+            get(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)).data.ownerUid == '' ||
+            get(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)).data.ownerUid == null
+          ) &&
+          getAfter(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId)/members/$(userId)).data.role == 'owner'
         )
       );
 
@@ -198,12 +242,24 @@ service cloud.firestore {
       // Tenant creation & deletion: restricted strictly to Root Admin and cannot overwrite existing tenants
       allow create: if isRootAdmin() && isValidId(tenantId) && !exists(/databases/$(database)/documents/tenants/$(tenantId));
       allow delete: if isRootAdmin();
-      // Tenant updates: Root Admin can update all fields; Provisioned Admins and Tenant Owners cannot modify protected identity, ownership, slug, status, or publish fields
+      // Tenant updates: Root Admin can update all fields; Provisioned Admins and Tenant Owners cannot modify protected identity, ownership, slug, status, or publish fields;
+      // Verified Google owner claiming an unclaimed active tenant may ONLY set ownerUid == request.auth.uid (and updatedAt) atomically with member creation
       allow update: if isRootAdmin() || (
         (isAdmin() || isTenantOwner(tenantId)) &&
         (!request.resource.data.diff(resource.data).affectedKeys().hasAny([
-          'status', 'isPublished', 'id', 'tenantId', 'slug', 'ownerEmail', 'createdAt'
+          'status', 'isPublished', 'id', 'tenantId', 'slug', 'ownerEmail', 'createdAt', 'ownerUid'
         ]))
+      ) || (
+        isGoogleVerifiedUser() &&
+        isValidId(tenantId) &&
+        resource.data.status == 'active' &&
+        'ownerEmail' in resource.data &&
+        resource.data.ownerEmail is string &&
+        resource.data.ownerEmail.lower() == request.auth.token.email.lower() &&
+        (!('ownerUid' in resource.data) || resource.data.ownerUid == '' || resource.data.ownerUid == null) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['ownerUid', 'updatedAt']) &&
+        request.resource.data.ownerUid == request.auth.uid &&
+        getAfter(/databases/$(database)/documents/tenants/$(tenantId)/members/$(request.auth.uid)).data.role == 'owner'
       );
 
       // Dedicated Public Website Configuration Document: /tenants/{tenantId}/public/website
@@ -298,6 +354,7 @@ service cloud.firestore {
         // Create:
         // Path A: Root Administrator can provision 'owner' or 'staff'.
         // Path C: Verified Staff Member SELF-ENROLLS via Atomic Invite Claim (Direct enrollment Path B removed)
+        // Path D: Verified Google Business Owner SELF-ENROLLS via Atomic Owner Invite Claim on unclaimed active tenant
         allow create: if isValidId(memberUid) && (
           (isRootAdmin() && isValidMemberData(request.resource.data, memberUid)) ||
           (
@@ -319,6 +376,36 @@ service cloud.firestore {
             request.time < getStaffInvite(tenantId, request.resource.data.inviteHash).data.expiresAt &&
             // 3. ENFORCE ATOMIC STATE TRANSITION: Invite MUST transition to 'claimed' in the same transaction
             getAfter(/databases/$(database)/documents/tenants/$(tenantId)/invites/$(request.resource.data.inviteHash)).data.status == 'claimed'
+          ) ||
+          (
+            // === PATH D: SECURE ATOMIC GOOGLE OWNER CLAIM ===
+            isGoogleVerifiedUser() &&
+            request.auth.uid == memberUid &&
+            request.resource.data.keys().hasAll(['uid', 'email', 'role', 'ownerInviteHash']) &&
+            request.resource.data.keys().hasOnly(['uid', 'email', 'role', 'ownerInviteHash', 'addedAt']) &&
+            request.resource.data.uid == memberUid &&
+            request.resource.data.role == 'owner' &&
+            request.resource.data.email is string &&
+            request.resource.data.email.lower() == request.auth.token.email.lower() &&
+            (!('addedAt' in request.resource.data) || (request.resource.data.addedAt is string && request.resource.data.addedAt.size() <= 50)) &&
+            isTenantActive(tenantId) &&
+            'ownerEmail' in get(/databases/$(database)/documents/tenants/$(tenantId)).data &&
+            get(/databases/$(database)/documents/tenants/$(tenantId)).data.ownerEmail is string &&
+            get(/databases/$(database)/documents/tenants/$(tenantId)).data.ownerEmail.lower() == request.auth.token.email.lower() &&
+            (
+              !('ownerUid' in get(/databases/$(database)/documents/tenants/$(tenantId)).data) ||
+              get(/databases/$(database)/documents/tenants/$(tenantId)).data.ownerUid == '' ||
+              get(/databases/$(database)/documents/tenants/$(tenantId)).data.ownerUid == null
+            ) &&
+            isValidId(request.resource.data.ownerInviteHash) &&
+            exists(/databases/$(database)/documents/ownerInvites/$(request.resource.data.ownerInviteHash)) &&
+            get(/databases/$(database)/documents/ownerInvites/$(request.resource.data.ownerInviteHash)).data.tenantId == tenantId &&
+            get(/databases/$(database)/documents/ownerInvites/$(request.resource.data.ownerInviteHash)).data.ownerEmail.lower() == request.auth.token.email.lower() &&
+            get(/databases/$(database)/documents/ownerInvites/$(request.resource.data.ownerInviteHash)).data.status == 'pending' &&
+            getAfter(/databases/$(database)/documents/ownerInvites/$(request.resource.data.ownerInviteHash)).data.status == 'claimed' &&
+            getAfter(/databases/$(database)/documents/tenants/$(tenantId)).data.ownerUid == request.auth.uid &&
+            getAfter(/databases/$(database)/documents/users/$(memberUid)).data.tenantId == tenantId &&
+            getAfter(/databases/$(database)/documents/users/$(memberUid)).data.role == 'owner'
           )
         );
 
@@ -429,6 +516,56 @@ service cloud.firestore {
         request.resource.data.tenantId is string &&
         isValidId(request.resource.data.tenantId) &&
         existsAfter(/databases/$(database)/documents/tenants/$(request.resource.data.tenantId));
+
+      allow delete: if isRootAdmin();
+    }
+
+    // ==========================================
+    // Owner Email Invitations: /ownerInvites/{emailHash}
+    // ==========================================
+    // Zero-enumeration lookup index for Google Sign-In tenant owner onboarding
+    match /ownerInvites/{emailHash} {
+      allow get: if isValidId(emailHash) && (
+        isRootAdmin() ||
+        (
+          isGoogleVerifiedUser() &&
+          resource != null &&
+          resource.data.ownerEmail is string &&
+          resource.data.ownerEmail.lower() == request.auth.token.email.lower()
+        )
+      );
+
+      allow list: if isRootAdmin();
+
+      allow create: if isRootAdmin() &&
+        isValidId(emailHash) &&
+        request.resource.data.keys().hasAll(['emailHash', 'ownerEmail', 'tenantId', 'status', 'createdAt']) &&
+        request.resource.data.keys().hasOnly(['emailHash', 'ownerEmail', 'tenantId', 'businessName', 'status', 'claimedByUid', 'claimedAt', 'createdAt', 'updatedAt']) &&
+        request.resource.data.emailHash == emailHash &&
+        request.resource.data.ownerEmail is string &&
+        request.resource.data.ownerEmail.size() > 3 &&
+        request.resource.data.ownerEmail.size() <= 150 &&
+        isValidId(request.resource.data.tenantId) &&
+        request.resource.data.status in ['pending', 'revoked'] &&
+        !exists(/databases/$(database)/documents/ownerInvites/$(emailHash));
+
+      allow update: if isValidId(emailHash) && (
+        isRootAdmin() ||
+        (
+          isGoogleVerifiedUser() &&
+          resource.data.status == 'pending' &&
+          resource.data.ownerEmail is string &&
+          resource.data.ownerEmail.lower() == request.auth.token.email.lower() &&
+          isTenantActive(resource.data.tenantId) &&
+          request.resource.data.status == 'claimed' &&
+          request.resource.data.claimedByUid == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'claimedByUid', 'claimedAt', 'updatedAt']) &&
+          getAfter(/databases/$(database)/documents/tenants/$(resource.data.tenantId)/members/$(request.auth.uid)).data.role == 'owner' &&
+          getAfter(/databases/$(database)/documents/tenants/$(resource.data.tenantId)).data.ownerUid == request.auth.uid &&
+          getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.tenantId == resource.data.tenantId &&
+          getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'owner'
+        )
+      );
 
       allow delete: if isRootAdmin();
     }

@@ -64,12 +64,67 @@
           "type": "string",
           "description": "Authoritative public URL slug mapped in /slugs/{slug}"
         },
+        "ownerEmail": {
+          "type": "string",
+          "format": "email",
+          "description": "Approved business owner Google email address"
+        },
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the owner who claimed the tenant"
+        },
         "createdAt": {
           "type": "string",
           "description": "ISO timestamp of tenant creation"
         }
       },
       "required": ["id", "name"]
+    },
+    "OwnerInvite": {
+      "title": "OwnerInvite",
+      "description": "Deterministic email-hash lookup record binding an approved Google email to a business tenant owner role",
+      "type": "object",
+      "properties": {
+        "emailHash": {
+          "type": "string",
+          "description": "Lowercase SHA-256 hex digest of ownerEmail matching document ID"
+        },
+        "ownerEmail": {
+          "type": "string",
+          "format": "email",
+          "description": "Approved Google account email (lowercase)"
+        },
+        "tenantId": {
+          "type": "string",
+          "description": "Target tenant organization ID"
+        },
+        "businessName": {
+          "type": "string",
+          "description": "Business name for display upon onboarding"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "claimed", "revoked"],
+          "description": "Owner invite claim lifecycle state"
+        },
+        "claimedByUid": {
+          "type": "string",
+          "description": "Firebase Auth UID that claimed owner membership"
+        },
+        "claimedAt": {
+          "type": "string",
+          "description": "ISO timestamp when owner claimed access"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp of owner invite creation"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last update"
+        }
+      },
+      "required": ["emailHash", "ownerEmail", "tenantId", "status", "createdAt"]
     },
     "SlugMapping": {
       "title": "SlugMapping",
@@ -239,6 +294,10 @@
     "/slugs/{slug}": {
       "schema": "SlugMapping",
       "description": "Authoritative public URL slug to tenant ID lookup"
+    },
+    "/ownerInvites/{emailHash}": {
+      "schema": "OwnerInvite",
+      "description": "Verified Google owner email lookup and single-claim lock for tenant onboarding"
     },
     "/tenants/{tenantId}": {
       "schema": "Tenant",

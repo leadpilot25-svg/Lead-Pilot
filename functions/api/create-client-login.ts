@@ -1,1062 +1,2179 @@
 /**
- * Cloudflare Pages Function: Secure Client CRM Owner Login Provisioning (/api/create-client-login)
- *
- * SECURITY ARCHITECTURE:
- * 1. Self-contained Cloudflare Pages Function (zero imports from sibling api/*.ts routes).
- * 2. Cryptographic RS256 Firebase ID Token Verification via Google JWKS + Web Crypto API.
- *    Tokens accepted strictly via "Authorization: Bearer <token>" header (never request body).
- * 3. Server-Authoritative Root Administrator Verification:
- *    - Requires server secret ROOT_ADMIN_UID matching verified token sub (uid)
- *    - Requires verified email 'mail.nasiya@gmail.com' with email_verified === true
- *    - Requires Google Sign-In provider ('google.com')
- * 4. Strict Tenant Validation:
- *    - Verifies /tenants/{tenantId} exists and status === 'active'
- *    - Rejects suspended or missing tenants (never auto-activates suspended tenants)
- *    - Rejects duplicate owner logins on the same tenant
- * 5. Secure User Creation & Password Setup Link via Service Account + Firebase Identity Toolkit Admin API:
- *    - Service account credentials read strictly from server environment secrets
- *      (FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY)
- *    - Rejects emails that already exist in Firebase Auth (HTTP 409) to prevent cross-tenant conflicts
- *    - Creates user in Firebase Auth without a permanent plaintext password
- *    - Writes /users/{uid} (role: 'owner', tenantId) and /tenants/{tenantId}/members/{uid} (role: 'owner')
- *    - Generates a one-time PASSWORD_RESET setup link (returnOobLink: true, no email sent)
- *    - Rolls back created Auth user and Firestore docs cleanly if any downstream step fails
+ * Client CRM Authentication & Tenant Session Management
+ * 
+ * Powered by Firebase Authentication and Firestore Security Rules.
+ * Guarantees cryptographic verification of user identity and strict tenant boundary isolation.
+ * Demo credentials and master passphrases have been purged from production.
  */
 
-export interface ExtendedJsonWebKey extends JsonWebKey {
-  kid?: string;
+import {
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  GoogleAuthProvider,
+  signOut,
+  onAuthStateChanged,
+  User as FirebaseUser,
+  createUserWithEmailAndPassword,
+} from 'firebase/auth';
+import {
+  doc,
+  getDoc,
+  setDoc,
+  getDocs,
+  collection,
+  runTransaction,
+  writeBatch,
+  Timestamp,
+  serverTimestamp,
+  deleteDoc,
+  updateDoc,
+} from 'firebase/firestore';
+import { auth, db, handleFirestoreError, OperationType } from '../firebase';
+import { CURRENT_APP_TARGET, IS_DEV_DEPLOYMENT } from '../config/appTarget';
+import { TenantRecord, TenantStatus, ClientConfig, SlugMapping } from '../types';
+
+export interface ClientUser {
+  userId: string;
+  email: string;
+  clientId: string;
+  businessName: string;
+  role: 'client_admin' | 'client_staff';
+  createdAt: string;
 }
 
-export interface CloudflareEnv {
-  FIREBASE_PROJECT_ID?: string;
-  FIRESTORE_DATABASE_ID?: string;
-  ROOT_ADMIN_UID?: string;
-  FIREBASE_SERVICE_ACCOUNT_JSON?: string;
-  FIREBASE_CLIENT_EMAIL?: string;
-  FIREBASE_PRIVATE_KEY?: string;
-  GOOGLE_JWKS_URL?: string;
-  TEST_JWK?: ExtendedJsonWebKey;
-  [key: string]: any;
+// Memory cache for active session
+let activeSessionUser: ClientUser | null = null;
+
+// Standard tenant metadata map for initial tenant assignment
+export const TENANT_METADATA_MAP: Record<string, { businessName: string; industry: string }> = {
+  'demo-tarot-kochi': {
+    businessName: 'Tarot Coaching & Guidance',
+    industry: 'tarot',
+  },
+  'demo-tarot': {
+    businessName: 'Tarot Coaching & Guidance',
+    industry: 'tarot',
+  },
+  'client-apex-hvac': {
+    businessName: 'Apex Heating & Cooling',
+    industry: 'hvac',
+  },
+  'roofing-client-01': {
+    businessName: 'Test Client',
+    industry: 'roofing',
+  },
+  'demo-roofing': {
+    businessName: 'Test Client',
+    industry: 'roofing',
+  },
+  'demo-hvac': {
+    businessName: 'Apex Heating & Cooling',
+    industry: 'hvac',
+  },
+  'prodrain-plumbing-kochi': {
+    businessName: 'ProDrain Plumbing',
+    industry: 'plumbing',
+  },
+  'demo-plumbing': {
+    businessName: 'ProDrain Plumbing',
+    industry: 'plumbing',
+  },
+  'demo-physio': {
+    businessName: 'Apex Physiotherapy Clinic',
+    industry: 'clinic',
+  },
+  'demo-clinic': {
+    businessName: 'Clinical Healthcare & Aesthetics',
+    industry: 'clinic',
+  },
+  'demo-realestate': {
+    businessName: 'Vanguard Realty Group',
+    industry: 'real-estate',
+  },
+  'demo-recruitment': {
+    businessName: 'Nexus Talent & Executive Search',
+    industry: 'recruitment',
+  },
+  'demo-skin-clinic': {
+    businessName: 'GlowAura Skin & Aesthetic Clinic [Example]',
+    industry: 'clinic',
+  },
+  'demo-local-service': {
+    businessName: 'PrimePoint Local Home Services [Example]',
+    industry: 'general-business',
+  },
+  'demo-general': {
+    businessName: 'PrimePoint Local Home Services [Example]',
+    industry: 'general-business',
+  },
+};
+
+/**
+ * Determine tenant ID for a user from their email or profile
+ */
+export function inferTenantFromEmail(email: string): string {
+  const clean = (email || '').toLowerCase().trim();
+  if (clean.includes('tarot')) return 'demo-tarot-kochi';
+  if (clean.includes('roofing') || clean.includes('roof')) return 'roofing-client-01';
+  if (clean.includes('hvac')) return 'client-apex-hvac';
+  if (clean.includes('plumb') || clean.includes('prodrain')) return 'prodrain-plumbing-kochi';
+  if (clean.includes('physio') || clean.includes('clinic')) return 'demo-clinic';
+  if (clean.includes('real') || clean.includes('realty')) return 'demo-realestate';
+  if (clean.includes('recruit') || clean.includes('talent')) return 'demo-recruitment';
+  
+  // Generic fallback slug from email domain/username
+  const parts = clean.split('@');
+  const slug = (parts[0] || 'client').replace(/[^a-z0-9_-]/g, '-').slice(0, 30);
+  return `client-${slug}`;
 }
 
-export interface PagesContext {
-  request: Request;
-  env: CloudflareEnv;
-  params?: Record<string, string | string[]>;
-  waitUntil?: (promise: Promise<any>) => void;
-  next?: () => Promise<Response>;
+// Track last onboarding denial reason for clear UI feedback (e.g., wrong/uninvited email, unverified email, suspended tenant)
+let lastGoogleOnboardingError: string | null = null;
+const inFlightProfileResolutions = new Map<string, Promise<ClientUser>>();
+
+export function getLastGoogleOnboardingError(): string | null {
+  return lastGoogleOnboardingError;
 }
 
-export interface ServiceAccountCredentials {
-  clientEmail: string;
-  privateKeyPem: string;
-  projectId?: string;
+export function clearLastGoogleOnboardingError(): void {
+  lastGoogleOnboardingError = null;
 }
 
-const ROOT_ADMIN_EMAIL = 'mail.nasiya@gmail.com';
-const TENANT_ID_REGEX = /^[a-z0-9_-]{1,128}$/;
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+/**
+ * Determine whether a Firebase user authenticated via Google with a verified email.
+ */
+export async function isGoogleVerifiedFirebaseUser(user: FirebaseUser | null): Promise<{
+  isGoogle: boolean;
+  emailVerified: boolean;
+  email: string;
+}> {
+  if (!user) {
+    return { isGoogle: false, emailVerified: false, email: '' };
+  }
+  const cleanEmail = (user.email || '').trim().toLowerCase();
+  const emailVerified = user.emailVerified === true;
 
-function getCorsHeaders(request?: Request): Record<string, string> {
-  const baseHeaders: Record<string, string> = {
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Max-Age': '86400',
-    Vary: 'Origin',
-  };
-
-  if (!request) return baseHeaders;
-
-  const origin = request.headers.get('Origin');
-  if (!origin) return baseHeaders;
-
-  try {
-    const reqOrigin = new URL(request.url).origin;
-    const parsedOrigin = new URL(origin);
-    const hostname = parsedOrigin.hostname.toLowerCase();
-
-    const isSameOrigin = origin === reqOrigin;
-    const isAllowedStaging =
-      parsedOrigin.protocol === 'https:' &&
-      (hostname === 'leadpilot-staging.pages.dev' || hostname.endsWith('.leadpilot-staging.pages.dev'));
-    const isLocalhost =
-      (parsedOrigin.protocol === 'http:' || parsedOrigin.protocol === 'https:') &&
-      (hostname === 'localhost' || hostname === '127.0.0.1');
-
-    if (isSameOrigin || isAllowedStaging || isLocalhost) {
-      baseHeaders['Access-Control-Allow-Origin'] = origin;
+  let signInProvider: string | null = null;
+  if (typeof (user as any).getIdTokenResult === 'function') {
+    try {
+      const tokenResult = await (user as any).getIdTokenResult();
+      signInProvider = tokenResult?.signInProvider || null;
+    } catch {
+      signInProvider = null;
     }
-  } catch {
-    // Omit Access-Control-Allow-Origin on malformed origin
   }
 
-  return baseHeaders;
+  const providerIds = Array.isArray(user.providerData)
+    ? user.providerData.map((p) => p?.providerId).filter((id): id is string => Boolean(id))
+    : [];
+
+  const isGoogle =
+    signInProvider !== null ? signInProvider === 'google.com' : providerIds.includes('google.com');
+
+  return { isGoogle, emailVerified, email: cleanEmail };
 }
 
-function jsonResponse(data: any, status = 200, request?: Request): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      'Content-Type': 'application/json',
-      'Cache-Control': 'no-store',
-      ...getCorsHeaders(request),
-    },
+/**
+ * Atomically claim tenant owner membership for a verified Google user whose email matches
+ * /ownerInvites/{sha256(email)} and an active, unclaimed /tenants/{tenantId}.
+ */
+export async function claimOwnerMembershipByGoogleUser(user: FirebaseUser): Promise<{
+  claimed: boolean;
+  tenantId?: string;
+  businessName?: string;
+  denialReason?: string;
+}> {
+  const identity = await isGoogleVerifiedFirebaseUser(user);
+  if (!identity.email) {
+    return {
+      claimed: false,
+      denialReason: 'Your Google account does not have an email address.',
+    };
+  }
+  if (!identity.isGoogle) {
+    return { claimed: false };
+  }
+  if (!identity.emailVerified) {
+    return {
+      claimed: false,
+      denialReason: 'Access denied: Your Google email address is not verified.',
+    };
+  }
+
+  // Root Admin never claims a client tenant owner invite
+  if (
+    matchesRootAdminIdentity({
+      email: identity.email,
+      emailVerified: identity.emailVerified,
+      signInProvider: 'google.com',
+    })
+  ) {
+    return { claimed: false };
+  }
+
+  const emailHash = await computeEmailHash(identity.email);
+  if (!emailHash) {
+    return { claimed: false, denialReason: 'Unable to verify owner email identifier.' };
+  }
+
+  const inviteRef = doc(db, 'ownerInvites', emailHash);
+  let inviteSnap;
+  try {
+    inviteSnap = await getDoc(inviteRef);
+  } catch (err: any) {
+    const code = err?.code || '';
+    if (code === 'permission-denied') {
+      return {
+        claimed: false,
+        denialReason: `Access denied: "${identity.email}" is not approved for any active LeadPilot business. Please ask your administrator to assign your Google email.`,
+      };
+    }
+    return {
+      claimed: false,
+      denialReason: err?.message || 'Unable to verify your business owner invitation.',
+    };
+  }
+
+  if (!inviteSnap.exists()) {
+    return {
+      claimed: false,
+      denialReason: `Access denied: "${identity.email}" is not approved for any active LeadPilot business.`,
+    };
+  }
+
+  const inviteData = inviteSnap.data();
+  const approvedEmail = (inviteData?.ownerEmail || '').trim().toLowerCase();
+  const targetTenantId = (inviteData?.tenantId || '').trim().toLowerCase();
+  const businessName =
+    inviteData?.businessName ||
+    TENANT_METADATA_MAP[targetTenantId]?.businessName ||
+    targetTenantId ||
+    'Business Client Portal';
+
+  if (!targetTenantId || approvedEmail !== identity.email) {
+    return {
+      claimed: false,
+      denialReason: `Access denied: Signed-in Google email "${identity.email}" does not match an approved business owner record.`,
+    };
+  }
+
+  if (inviteData.status === 'revoked') {
+    return {
+      claimed: false,
+      denialReason: `Access denied: The owner invitation for "${identity.email}" has been revoked.`,
+    };
+  }
+
+  if (inviteData.status === 'claimed') {
+    if (inviteData.claimedByUid && inviteData.claimedByUid !== user.uid) {
+      return {
+        claimed: false,
+        denialReason:
+          'Access denied: This business account has already been claimed by another Google user.',
+      };
+    }
+    return {
+      claimed: false,
+      denialReason:
+        'Access denied: This owner invitation has already been used.',
+    };
+  }
+
+  const timestamp = new Date().toISOString();
+  const memberRef = doc(db, 'tenants', targetTenantId, 'members', user.uid);
+  const tenantRef = doc(db, 'tenants', targetTenantId);
+  const userRef = doc(db, 'users', user.uid);
+
+  try {
+    await runTransaction(db, async (txn) => {
+      const [freshInviteSnap, existingUserSnap] = await Promise.all([
+        txn.get(inviteRef),
+        txn.get(userRef),
+      ]);
+
+      if (!freshInviteSnap.exists()) {
+        throw new Error('Owner invitation record no longer exists.');
+      }
+      const freshInvite = freshInviteSnap.data();
+      if (freshInvite.status !== 'pending') {
+        throw new Error('This business account has already been claimed or revoked.');
+      }
+
+      const existingCreatedAt = existingUserSnap.exists()
+        ? existingUserSnap.data()?.createdAt || timestamp
+        : timestamp;
+
+      // 1. Create /tenants/{tenantId}/members/{uid} with role: 'owner'
+      txn.set(memberRef, {
+        uid: user.uid,
+        email: identity.email,
+        role: 'owner',
+        ownerInviteHash: emailHash,
+        addedAt: timestamp,
+      });
+
+      // 2. Lock /tenants/{tenantId}.ownerUid to prevent second-user claim
+      txn.update(tenantRef, {
+        ownerUid: user.uid,
+        updatedAt: timestamp,
+      });
+
+      // 3. Mark /ownerInvites/{emailHash} as claimed atomically
+      txn.update(inviteRef, {
+        status: 'claimed',
+        claimedByUid: user.uid,
+        claimedAt: timestamp,
+        updatedAt: timestamp,
+      });
+
+      // 4. Provision/upgrade /users/{uid} strictly within schema keys
+      txn.set(userRef, {
+        uid: user.uid,
+        email: identity.email,
+        displayName: user.displayName || identity.email.split('@')[0] || 'Business Owner',
+        businessName,
+        tenantId: targetTenantId,
+        role: 'owner',
+        createdAt: existingCreatedAt,
+      });
+    });
+
+    return {
+      claimed: true,
+      tenantId: targetTenantId,
+      businessName,
+    };
+  } catch (err: any) {
+    const code = err?.code || '';
+    if (code === 'permission-denied') {
+      return {
+        claimed: false,
+        denialReason: `Access denied for "${businessName}" (${targetTenantId}): The business account may be suspended, already claimed by another user, or awaiting activation.`,
+      };
+    }
+    return {
+      claimed: false,
+      denialReason: err?.message || 'Unable to connect your Google account to the business tenant.',
+    };
+  }
+}
+
+/**
+ * Fetch or bootstrap user profile document in Firestore.
+ * For verified Google users without an assigned tenant, attempts atomic email-matched owner claiming
+ * unless the session is claiming a team staff invitation link.
+ */
+export async function getOrProvisionUserProfile(user: FirebaseUser, desiredTenantId?: string): Promise<ClientUser> {
+  const existingInFlight = inFlightProfileResolutions.get(user.uid);
+  if (existingInFlight) {
+    return existingInFlight;
+  }
+
+  const resolutionPromise = (async (): Promise<ClientUser> => {
+    const userRef = doc(db, 'users', user.uid);
+    let tenantId = desiredTenantId || '';
+    let businessName = 'Business Client Portal';
+    let role: 'client_admin' | 'client_staff' = 'client_admin';
+    let needsOnboardingClaim = false;
+
+    const hasPendingStaffInvite =
+      typeof window !== 'undefined' &&
+      Boolean(new URLSearchParams(window.location.search).get('inviteTenant')) &&
+      Boolean(new URLSearchParams(window.location.search).get('inviteHash'));
+
+    try {
+      const snap = await getDoc(userRef);
+      if (snap.exists()) {
+        const data = snap.data();
+        const existingTenant = (data.tenantId || '').trim();
+        const rawRole = (data.role || '').toString().toLowerCase().trim();
+
+        if (existingTenant && rawRole && rawRole !== 'unassigned') {
+          tenantId = existingTenant;
+          role =
+            rawRole === 'owner' || rawRole === 'admin' || rawRole === 'client_admin'
+              ? 'client_admin'
+              : 'client_staff';
+          businessName = data.businessName || TENANT_METADATA_MAP[tenantId]?.businessName || businessName;
+          lastGoogleOnboardingError = null;
+        } else {
+          needsOnboardingClaim = true;
+        }
+      } else {
+        needsOnboardingClaim = true;
+      }
+
+      if (needsOnboardingClaim && !hasPendingStaffInvite) {
+        const identity = await isGoogleVerifiedFirebaseUser(user);
+        const isRoot = matchesRootAdminIdentity({
+          email: user.email,
+          emailVerified: user.emailVerified,
+          signInProvider: identity.isGoogle ? 'google.com' : null,
+        });
+
+        if (identity.isGoogle && !isRoot) {
+          const claimRes = await claimOwnerMembershipByGoogleUser(user);
+          if (claimRes.claimed && claimRes.tenantId) {
+            tenantId = claimRes.tenantId;
+            businessName = claimRes.businessName || businessName;
+            role = 'client_admin';
+            lastGoogleOnboardingError = null;
+          } else {
+            tenantId = '';
+            role = 'client_staff';
+            businessName = 'Unassigned Client Portal';
+            lastGoogleOnboardingError =
+              claimRes.denialReason ||
+              `Access denied: No active business account is linked to "${identity.email || user.email}".`;
+          }
+        } else if (!snap.exists()) {
+          // First-time baseline unassigned profile for non-Google / Root Admin / Staff Invite signup
+          tenantId = '';
+          role = 'client_staff';
+          businessName = 'Unassigned Client Portal';
+          const newUserData = {
+            uid: user.uid,
+            email: user.email || '',
+            displayName: user.displayName || user.email?.split('@')[0] || 'Client User',
+            tenantId: '',
+            businessName: 'Unassigned Client Portal',
+            role: 'unassigned',
+            createdAt: new Date().toISOString(),
+          };
+          try {
+            await setDoc(userRef, newUserData);
+          } catch (writeErr) {
+            console.warn('Note: Could not create user profile document:', writeErr);
+          }
+        } else {
+          tenantId = '';
+          role = 'client_staff';
+          businessName = 'Unassigned Client Portal';
+        }
+      } else if (needsOnboardingClaim && hasPendingStaffInvite && !snap.exists()) {
+        tenantId = '';
+        role = 'client_staff';
+        businessName = 'Unassigned Client Portal';
+        try {
+          await setDoc(userRef, {
+            uid: user.uid,
+            email: user.email || '',
+            displayName: user.displayName || user.email?.split('@')[0] || 'Team Member',
+            tenantId: '',
+            businessName: 'Unassigned Client Portal',
+            role: 'unassigned',
+            createdAt: new Date().toISOString(),
+          });
+        } catch (writeErr) {
+          console.warn('Note: Could not create baseline user profile before invite claim:', writeErr);
+        }
+      }
+    } catch (err) {
+      console.warn('Reading user profile from Firestore:', err);
+    }
+
+    const clientUser: ClientUser = {
+      userId: user.uid,
+      email: user.email || '',
+      clientId: tenantId,
+      businessName,
+      role,
+      createdAt: new Date().toISOString(),
+    };
+
+    activeSessionUser = clientUser;
+    return clientUser;
+  })();
+
+  inFlightProfileResolutions.set(user.uid, resolutionPromise);
+  try {
+    return await resolutionPromise;
+  } finally {
+    inFlightProfileResolutions.delete(user.uid);
+  }
+}
+
+/**
+ * Get active client session ONLY after real Firestore user profile resolution.
+ * Never guesses tenantId or role from an email address.
+ */
+export function getCurrentClientSession(): ClientUser | null {
+  return activeSessionUser;
+}
+
+/**
+ * Listen to Firebase Auth state changes
+ */
+export function onClientAuthStateChanged(callback: (user: ClientUser | null) => void): () => void {
+  return onAuthStateChanged(auth, async (fbUser) => {
+    if (fbUser) {
+      try {
+        const user = await getOrProvisionUserProfile(fbUser);
+        activeSessionUser = user;
+        callback(user);
+      } catch {
+        activeSessionUser = null;
+        callback(null);
+      }
+    } else {
+      activeSessionUser = null;
+      lastGoogleOnboardingError = null;
+      callback(null);
+    }
+    window.dispatchEvent(new Event('leadpilot_auth_changed'));
   });
 }
 
-// ============================================================================
-// 1. Web Crypto, Base64URL & PEM Helpers
-// ============================================================================
+/**
+ * Authenticate client with Firebase Email and Password
+ */
+export async function loginClient(
+  identifier: string,
+  password: string,
+  tenantScope?: string
+): Promise<{ success: boolean; user?: ClientUser; error?: string }> {
+  const cleanId = (identifier || '').trim();
+  const cleanPass = (password || '').trim();
 
-export function base64UrlToUint8Array(base64Url: string): Uint8Array {
-  let base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-  while (base64.length % 4 !== 0) {
-    base64 += '=';
-  }
-  const binaryStr = atob(base64);
-  const bytes = new Uint8Array(binaryStr.length);
-  for (let i = 0; i < binaryStr.length; i++) {
-    bytes[i] = binaryStr.charCodeAt(i);
-  }
-  return bytes;
-}
-
-export function bytesToBase64Url(bytes: Uint8Array): string {
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-export function utf8ToBase64Url(input: string): string {
-  return bytesToBase64Url(new TextEncoder().encode(input));
-}
-
-export function pemToPkcs8Bytes(pem: string): Uint8Array {
-  const normalized = pem
-    .replace(/\\n/g, '\n')
-    .replace(/-----BEGIN PRIVATE KEY-----/g, '')
-    .replace(/-----END PRIVATE KEY-----/g, '')
-    .replace(/\s+/g, '');
-
-  if (!normalized) {
-    throw new Error('Empty private key PEM.');
+  if (!cleanId || !cleanPass) {
+    return { success: false, error: 'Please enter your email and password.' };
   }
 
-  const binaryStr = atob(normalized);
-  const bytes = new Uint8Array(binaryStr.length);
-  for (let i = 0; i < binaryStr.length; i++) {
-    bytes[i] = binaryStr.charCodeAt(i);
-  }
-  return bytes;
-}
+  // Format email if username/clientId was provided
+  const email = cleanId.includes('@') ? cleanId.toLowerCase() : `${cleanId.toLowerCase()}@leadpilotcrm.internal`;
 
-export function decodeJwtParts(token: string): {
-  header: any | null;
-  payload: any | null;
-  signature: string;
-  signedData: string;
-} | null {
   try {
-    const parts = token.split('.');
-    if (parts.length !== 3) return null;
+    const cred = await signInWithEmailAndPassword(auth, email, cleanPass);
+    const clientUser = await getOrProvisionUserProfile(cred.user, tenantScope);
+    activeSessionUser = clientUser;
+    window.dispatchEvent(new Event('leadpilot_auth_changed'));
+    return { success: true, user: clientUser };
+  } catch (err: any) {
+    const code = err?.code || '';
+    if (code === 'auth/user-not-found' || code === 'auth/invalid-credential') {
+      // In development mode only, facilitate test-user auto-provisioning for testing
+      if (IS_DEV_DEPLOYMENT) {
+        try {
+          const newCred = await createUserWithEmailAndPassword(auth, email, cleanPass);
+          const clientUser = await getOrProvisionUserProfile(newCred.user, tenantScope);
+          activeSessionUser = clientUser;
+          window.dispatchEvent(new Event('leadpilot_auth_changed'));
+          return { success: true, user: clientUser };
+        } catch (createErr: any) {
+          return { success: false, error: createErr?.message || 'Authentication failed' };
+        }
+      }
+      return { success: false, error: 'Invalid email or password. Please verify your credentials.' };
+    }
+    if (code === 'auth/wrong-password') {
+      return { success: false, error: 'Incorrect password. Please try again.' };
+    }
+    if (code === 'auth/too-many-requests') {
+      return { success: false, error: 'Access temporarily disabled due to many failed attempts. Try again later.' };
+    }
+    return { success: false, error: err?.message || 'Authentication failed. Please verify your credentials.' };
+  }
+}
 
-    const header = JSON.parse(
-      atob(parts[0].replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(parts[0].length / 4) * 4, '='))
-    );
-    const payload = JSON.parse(
-      atob(parts[1].replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(parts[1].length / 4) * 4, '='))
-    );
+/**
+ * Authenticate client using Firebase Google Sign-In Popup.
+ * Automatically validates verified Google email against /ownerInvites and active tenant status.
+ */
+export async function loginWithGoogle(
+  desiredTenantId?: string
+): Promise<{ success: boolean; user?: ClientUser; error?: string }> {
+  lastGoogleOnboardingError = null;
+  try {
+    const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: 'select_account' });
+    const cred = await signInWithPopup(auth, provider);
+    const clientUser = await getOrProvisionUserProfile(cred.user, desiredTenantId);
+    activeSessionUser = clientUser;
+    window.dispatchEvent(new Event('leadpilot_auth_changed'));
 
+    if (!clientUser.clientId && lastGoogleOnboardingError) {
+      return { success: true, user: clientUser, error: lastGoogleOnboardingError };
+    }
+    return { success: true, user: clientUser };
+  } catch (err: any) {
+    console.error('Google Sign-In error:', err);
+    return { success: false, error: err?.message || 'Google Sign-In failed or popup was closed.' };
+  }
+}
+
+/**
+ * Register / Create a new client tenant account
+ */
+export async function registerClient(
+  email: string,
+  password: string,
+  _tenantId?: string,
+  _businessName?: string
+): Promise<{ success: boolean; user?: ClientUser; error?: string }> {
+  const cleanEmail = email.trim().toLowerCase();
+  const cleanPass = password.trim();
+
+  if (!cleanEmail || !cleanPass || cleanPass.length < 6) {
+    return { success: false, error: 'Password must be at least 6 characters.' };
+  }
+
+  try {
+    const cred = await createUserWithEmailAndPassword(auth, cleanEmail, cleanPass);
+    // Secure bootstrap: Creates initial user profile with role: 'unassigned' and tenantId: ''
+    // Conforms strictly to zero-trust Firestore rules (non-admins cannot self-assign owner roles or tenant IDs)
+    const clientUser = await getOrProvisionUserProfile(cred.user);
+    activeSessionUser = clientUser;
+    window.dispatchEvent(new Event('leadpilot_auth_changed'));
     return {
-      header,
-      payload,
-      signature: parts[2],
-      signedData: `${parts[0]}.${parts[1]}`,
+      success: true,
+      user: clientUser,
+      error: 'Account registered. Tenant assignment and owner activation must be provisioned by the platform administrator.',
     };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Registration failed.' };
+  }
+}
+
+/**
+ * Secure Logout
+ */
+export async function logoutClient(): Promise<void> {
+  activeSessionUser = null;
+  try {
+    await signOut(auth);
+  } catch (err) {
+    console.error('Sign out error:', err);
+  }
+  window.dispatchEvent(new Event('leadpilot_auth_changed'));
+}
+
+export const ROOT_ADMIN_EMAIL = 'mail.nasiya@gmail.com';
+
+export interface AdminCapabilities {
+  isRootAdmin: boolean;
+  isAdmin: boolean;
+}
+
+/**
+ * Pure helper evaluating whether Firebase auth attributes satisfy Root Admin requirements
+ * matching firestore.rules isRootAdmin():
+ * - exact email 'mail.nasiya@gmail.com'
+ * - emailVerified === true
+ * - signInProvider === 'google.com'
+ */
+export function matchesRootAdminIdentity(params: {
+  email?: string | null;
+  emailVerified?: boolean;
+  signInProvider?: string | null;
+  providerIds?: string[];
+}): boolean {
+  const cleanEmail = (params.email || '').toLowerCase().trim();
+  if (cleanEmail !== ROOT_ADMIN_EMAIL) return false;
+  if (params.emailVerified !== true) return false;
+
+  if (params.signInProvider !== undefined && params.signInProvider !== null) {
+    return params.signInProvider === 'google.com';
+  }
+  return Array.isArray(params.providerIds) && params.providerIds.includes('google.com');
+}
+
+/**
+ * Server-side verification separating Root Admin vs Provisioned Admin capabilities.
+ * - isRootAdmin: strictly requires verified mail.nasiya@gmail.com signed in via google.com
+ * - isAdmin: isRootAdmin OR provisioned document in /admins/{uid}
+ */
+export async function verifyServerAdminCapabilities(
+  user: FirebaseUser | null
+): Promise<AdminCapabilities> {
+  if (!user) {
+    return { isRootAdmin: false, isAdmin: false };
+  }
+
+  let signInProvider: string | null = null;
+  if (typeof (user as any).getIdTokenResult === 'function') {
+    try {
+      const tokenResult = await (user as any).getIdTokenResult();
+      signInProvider = tokenResult?.signInProvider || null;
+    } catch {
+      signInProvider = null;
+    }
+  }
+
+  const providerIds = Array.isArray(user.providerData)
+    ? user.providerData.map((p) => p?.providerId).filter((id): id is string => Boolean(id))
+    : [];
+
+  if (
+    matchesRootAdminIdentity({
+      email: user.email,
+      emailVerified: user.emailVerified,
+      signInProvider,
+      providerIds,
+    })
+  ) {
+    return { isRootAdmin: true, isAdmin: true };
+  }
+
+  // Provisioned administrator lookup in /admins/{uid}
+  try {
+    const adminDoc = await getDoc(doc(db, 'admins', user.uid));
+    if (adminDoc.exists()) {
+      return { isRootAdmin: false, isAdmin: true };
+    }
   } catch {
+    return { isRootAdmin: false, isAdmin: false };
+  }
+
+  return { isRootAdmin: false, isAdmin: false };
+}
+
+/**
+ * Strictly verify Root Administrator status (mail.nasiya@gmail.com + verified + google.com).
+ */
+export async function verifyRootAdminStatus(user: FirebaseUser | null): Promise<boolean> {
+  const caps = await verifyServerAdminCapabilities(user);
+  return caps.isRootAdmin;
+}
+
+/**
+ * Server-side verification of platform administrator permissions (Root Admin OR provisioned /admins/{uid}).
+ * Preserved for existing callers that check general admin capability.
+ */
+export async function verifyServerAdminStatus(user: FirebaseUser | null): Promise<boolean> {
+  const caps = await verifyServerAdminCapabilities(user);
+  return caps.isAdmin;
+}
+
+/**
+ * Helper to safely resolve tenant status with fail-closed security.
+ * Missing, null, or unexpected status values are NEVER treated as active.
+ * Only exact string 'active' is active; everything else is treated as 'suspended'.
+ */
+export function resolveSafeTenantStatus(rawStatus: any): TenantStatus {
+  if (rawStatus === 'active') {
+    return 'active';
+  }
+  return 'suspended';
+}
+
+/**
+ * Retrieve tenant account metadata from /tenants/{tenantId}
+ * Fail-closed: missing, null, or unexpected status is never treated as active.
+ */
+export async function getTenantRecord(tenantId: string): Promise<TenantRecord | null> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  if (!cleanTenant) return null;
+
+  try {
+    const snap = await getDoc(doc(db, 'tenants', cleanTenant));
+    if (!snap.exists()) return null;
+    const data = snap.data();
+    return {
+      tenantId: data.id || data.tenantId || cleanTenant,
+      businessName: data.name || data.businessName || cleanTenant,
+      industry: data.industry || 'general-business',
+      status: resolveSafeTenantStatus(data.status),
+      isPublished: Boolean(data.isPublished),
+      ownerEmail: data.ownerEmail || '',
+      ownerUid: data.ownerUid || '',
+      slug: data.slug || '',
+      createdAt: data.createdAt || new Date().toISOString(),
+      updatedAt: data.updatedAt,
+    };
+  } catch (err) {
+    console.warn(`Could not read tenant metadata for ${cleanTenant}:`, err);
     return null;
   }
 }
 
-// ============================================================================
-// 2. Cryptographic Firebase ID Token Verification
-// ============================================================================
-
-interface JwksCache {
-  keys: Map<string, ExtendedJsonWebKey>;
-  expiresAt: number;
-}
-
-let memoryJwksCache: JwksCache | null = null;
-
-async function fetchGoogleJwks(
-  jwksUrl: string | undefined,
-  fetchFn: typeof fetch
-): Promise<Map<string, ExtendedJsonWebKey>> {
-  const now = Date.now();
-  if (!jwksUrl && memoryJwksCache && memoryJwksCache.expiresAt > now) {
-    return memoryJwksCache.keys;
-  }
-
-  const url =
-    jwksUrl || 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
-  const res = await fetchFn(url, { headers: { Accept: 'application/json' } });
-  if (!res.ok) {
-    throw new Error(`Failed to fetch Google public JWKS (HTTP ${res.status}).`);
-  }
-
-  let maxAge = 3600;
-  const cacheControl = res.headers.get('Cache-Control') || '';
-  const match = cacheControl.match(/max-age=(\d+)/);
-  if (match && match[1]) {
-    maxAge = parseInt(match[1], 10);
-  }
-
-  const data: any = await res.json();
-  const keysMap = new Map<string, ExtendedJsonWebKey>();
-  if (Array.isArray(data.keys)) {
-    for (const key of data.keys) {
-      if (key.kid) {
-        keysMap.set(key.kid, key);
-      }
-    }
-  }
-
-  if (!jwksUrl) {
-    memoryJwksCache = {
-      keys: keysMap,
-      expiresAt: now + maxAge * 1000,
-    };
-  }
-
-  return keysMap;
-}
-
-export function validateFirebaseTokenClaims(
-  payload: any,
-  expectedProjectId: string
-): { isValid: boolean; error?: string } {
-  if (!payload || typeof payload !== 'object') {
-    return { isValid: false, error: 'Malformed token payload.' };
-  }
-
-  const nowSec = Math.floor(Date.now() / 1000);
-
-  if (!payload.exp || typeof payload.exp !== 'number' || payload.exp < nowSec - 30) {
-    return { isValid: false, error: 'Firebase authentication token has expired.' };
-  }
-  if (payload.iat && typeof payload.iat === 'number' && payload.iat > nowSec + 30) {
-    return { isValid: false, error: 'Firebase token issued in the future.' };
-  }
-  if (payload.auth_time && typeof payload.auth_time === 'number' && payload.auth_time > nowSec + 30) {
-    return { isValid: false, error: 'Firebase authentication time is in the future.' };
-  }
-
-  const expectedIssuer = `https://securetoken.google.com/${expectedProjectId}`;
-  if (payload.iss !== expectedIssuer) {
-    return { isValid: false, error: `Invalid token issuer: expected ${expectedIssuer}.` };
-  }
-  if (payload.aud !== expectedProjectId) {
-    return { isValid: false, error: `Invalid token audience: expected ${expectedProjectId}.` };
-  }
-  if (!payload.sub || typeof payload.sub !== 'string' || payload.sub.trim().length === 0) {
-    return { isValid: false, error: 'Missing user identifier in token.' };
-  }
-
-  return { isValid: true };
-}
-
-export async function verifyFirebaseIdToken(
-  token: string,
-  expectedProjectId: string,
-  env: CloudflareEnv,
-  fetchFn: typeof fetch = fetch
-): Promise<{ isValid: boolean; payload?: any; error?: string }> {
-  const parts = decodeJwtParts(token);
-  if (!parts) {
-    return { isValid: false, error: 'Malformed or invalid JWT format.' };
-  }
-
-  const { header, payload, signature, signedData } = parts;
-  if (!header || typeof header !== 'object') {
-    return { isValid: false, error: 'Invalid JWT header.' };
-  }
-  if (header.alg !== 'RS256') {
-    return { isValid: false, error: `Unsupported JWT algorithm: expected RS256, got ${header.alg}.` };
-  }
-  if (!header.kid || typeof header.kid !== 'string') {
-    return { isValid: false, error: 'Missing key ID (kid) in JWT header.' };
-  }
-
-  let jwk: ExtendedJsonWebKey | undefined;
-  if (env.TEST_JWK && env.TEST_JWK.kid === header.kid) {
-    jwk = env.TEST_JWK;
-  } else {
-    try {
-      const keysMap = await fetchGoogleJwks(env.GOOGLE_JWKS_URL, fetchFn);
-      jwk = keysMap.get(header.kid);
-    } catch (err: any) {
-      return {
-        isValid: false,
-        error: `Failed to retrieve Google signing keys: ${err?.message || 'Network error'}`,
-      };
-    }
-  }
-
-  if (!jwk) {
-    return { isValid: false, error: `Signing key (kid "${header.kid}") not found or rotated.` };
-  }
-
+/**
+ * List all registered tenant accounts from /tenants (Administrator only)
+ * Fail-closed: missing, null, or unexpected status is never treated as active.
+ */
+export async function listTenantRecords(): Promise<TenantRecord[]> {
   try {
-    const cryptoKey = await crypto.subtle.importKey(
-      'jwk',
-      jwk,
-      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-      false,
-      ['verify']
-    );
-
-    const signedBytes = new TextEncoder().encode(signedData);
-    const signatureBytes = base64UrlToUint8Array(signature);
-
-    const isSigValid = await crypto.subtle.verify(
-      'RSASSA-PKCS1-v1_5',
-      cryptoKey,
-      signatureBytes,
-      signedBytes
-    );
-
-    if (!isSigValid) {
-      return { isValid: false, error: 'Invalid cryptographic token signature.' };
-    }
-  } catch (err: any) {
-    return {
-      isValid: false,
-      error: `Cryptographic signature verification failed: ${err?.message || 'Crypto error'}`,
-    };
+    const snap = await getDocs(collection(db, 'tenants'));
+    const list: TenantRecord[] = [];
+    snap.forEach((d) => {
+      const data = d.data();
+      list.push({
+        tenantId: data.id || data.tenantId || d.id,
+        businessName: data.name || data.businessName || d.id,
+        industry: data.industry || 'general-business',
+        status: resolveSafeTenantStatus(data.status),
+        isPublished: Boolean(data.isPublished),
+        ownerEmail: data.ownerEmail || '',
+        ownerUid: data.ownerUid || '',
+        slug: data.slug || '',
+        createdAt: data.createdAt || new Date().toISOString(),
+        updatedAt: data.updatedAt,
+      });
+    });
+    return list;
+  } catch (err) {
+    console.warn('Could not list tenant records:', err);
+    return [];
   }
-
-  const claimsCheck = validateFirebaseTokenClaims(payload, expectedProjectId);
-  if (!claimsCheck.isValid) {
-    return { isValid: false, error: claimsCheck.error };
-  }
-
-  return { isValid: true, payload };
 }
 
-// ============================================================================
-// 3. Service Account OAuth2 JWT Minting (Web Crypto RS256)
-// ============================================================================
+/**
+ * Create or provision a tenant account in Firestore under /tenants/{tenantId} (Administrator only)
+ * Uses runTransaction() to guarantee atomic creation:
+ * - Reads document inside the transaction
+ * - If document exists, rejects creation immediately
+ * - If ownerEmail is provided, reserves /ownerInvites/{emailHash} atomically
+ * - Preserves existing administrator authorization through Firestore rules
+ */
+export async function createTenantRecord(
+  tenant: Omit<TenantRecord, 'createdAt' | 'updatedAt'>
+): Promise<{ success: boolean; tenant?: TenantRecord; error?: string }> {
+  const cleanId = (tenant.tenantId || '').trim().toLowerCase();
+  if (!cleanId) {
+    return { success: false, error: 'Tenant ID is required.' };
+  }
 
-export function resolveServiceAccountCredentials(env: CloudflareEnv): ServiceAccountCredentials | null {
-  if (env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-    try {
-      const parsed =
-        typeof env.FIREBASE_SERVICE_ACCOUNT_JSON === 'string'
-          ? JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON)
-          : env.FIREBASE_SERVICE_ACCOUNT_JSON;
-      const clientEmail = typeof parsed?.client_email === 'string' ? parsed.client_email.trim() : '';
-      const privateKeyPem = typeof parsed?.private_key === 'string' ? parsed.private_key : '';
-      const projectId = typeof parsed?.project_id === 'string' ? parsed.project_id.trim() : undefined;
-      if (clientEmail && privateKeyPem) {
-        return { clientEmail, privateKeyPem, projectId };
-      }
-    } catch {
-      return null;
+  const cleanOwnerEmail = tenant.ownerEmail ? tenant.ownerEmail.trim().toLowerCase() : '';
+  if (cleanOwnerEmail) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanOwnerEmail)) {
+      return { success: false, error: 'Please enter a valid Google owner email address.' };
+    }
+    if (cleanOwnerEmail === ROOT_ADMIN_EMAIL) {
+      return { success: false, error: 'Root Administrator email cannot be assigned as a client owner.' };
     }
   }
 
-  const clientEmail = typeof env.FIREBASE_CLIENT_EMAIL === 'string' ? env.FIREBASE_CLIENT_EMAIL.trim() : '';
-  const privateKeyPem = typeof env.FIREBASE_PRIVATE_KEY === 'string' ? env.FIREBASE_PRIVATE_KEY : '';
-  if (clientEmail && privateKeyPem) {
-    return { clientEmail, privateKeyPem };
+  let normalizedSlug = '';
+  if (tenant.slug && tenant.slug.trim()) {
+    const slugCheck = validateAndNormalizeSlug(tenant.slug);
+    if (!slugCheck.isValid) {
+      return { success: false, error: slugCheck.error || 'Invalid URL slug.' };
+    }
+    normalizedSlug = slugCheck.normalizedSlug;
   }
 
-  return null;
-}
-
-export async function createServiceAccountJwt(
-  credentials: ServiceAccountCredentials,
-  scopes = 'https://www.googleapis.com/auth/identitytoolkit'
-): Promise<string> {
-  const nowSec = Math.floor(Date.now() / 1000);
-  const header = { alg: 'RS256', typ: 'JWT' };
-  const claimSet = {
-    iss: credentials.clientEmail,
-    sub: credentials.clientEmail,
-    aud: 'https://oauth2.googleapis.com/token',
-    scope: scopes,
-    iat: nowSec,
-    exp: nowSec + 3600,
+  const timestamp = new Date().toISOString();
+  const safeStatus = resolveSafeTenantStatus(tenant.status);
+  const newRecord: TenantRecord = {
+    tenantId: cleanId,
+    businessName: tenant.businessName.trim(),
+    industry: tenant.industry.trim() || 'general-business',
+    status: safeStatus,
+    isPublished: Boolean(tenant.isPublished),
+    ownerEmail: cleanOwnerEmail,
+    ...(normalizedSlug ? { slug: normalizedSlug } : {}),
+    createdAt: timestamp,
+    updatedAt: timestamp,
   };
 
-  const signingInput = `${utf8ToBase64Url(JSON.stringify(header))}.${utf8ToBase64Url(JSON.stringify(claimSet))}`;
-  const pkcs8Bytes = pemToPkcs8Bytes(credentials.privateKeyPem);
-
-  const cryptoKey = await crypto.subtle.importKey(
-    'pkcs8',
-    pkcs8Bytes,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-
-  const signatureBuffer = await crypto.subtle.sign(
-    'RSASSA-PKCS1-v1_5',
-    cryptoKey,
-    new TextEncoder().encode(signingInput)
-  );
-
-  const signatureB64 = bytesToBase64Url(new Uint8Array(signatureBuffer));
-  return `${signingInput}.${signatureB64}`;
-}
-
-async function fetchGoogleAdminAccessToken(
-  credentials: ServiceAccountCredentials,
-  fetchFn: typeof fetch
-): Promise<string> {
-  const assertion = await createServiceAccountJwt(credentials);
-  const formBody = new URLSearchParams({
-    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-    assertion,
-  });
-
-  const tokenRes = await fetchFn('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: formBody.toString(),
-  });
-
-  const tokenJson: any = await tokenRes.json().catch(() => ({}));
-  if (!tokenRes.ok || !tokenJson?.access_token) {
-    throw new Error(
-      tokenJson?.error_description || tokenJson?.error || `OAuth2 token exchange failed (HTTP ${tokenRes.status}).`
-    );
-  }
-
-  return String(tokenJson.access_token);
-}
-
-// ============================================================================
-// 4. Firestore & Identity Toolkit REST Helpers
-// ============================================================================
-
-function parseIdentityToolkitError(data: any, fallback: string): string {
-  const rawMessage = data?.error?.message || data?.message || '';
-  if (typeof rawMessage === 'string' && rawMessage.trim()) {
-    return rawMessage.trim();
-  }
-  return fallback;
-}
-
-function buildContinueUrl(request: Request, tenantId: string): string | undefined {
-  const origin = request.headers.get('Origin');
-  if (!origin) return undefined;
   try {
-    const url = new URL(origin);
-    if (url.protocol !== 'https:' && url.hostname !== 'localhost' && url.hostname !== '127.0.0.1') {
-      return undefined;
-    }
-    return `${url.origin}/?target=crm&tenant=${encodeURIComponent(tenantId)}`;
-  } catch {
-    return undefined;
-  }
-}
+    const ownerEmailHash = cleanOwnerEmail ? await computeEmailHash(cleanOwnerEmail) : '';
+    const tenantDocRef = doc(db, 'tenants', cleanId);
+    const slugDocRef = normalizedSlug ? doc(db, 'slugs', normalizedSlug) : null;
+    const ownerInviteRef = ownerEmailHash ? doc(db, 'ownerInvites', ownerEmailHash) : null;
 
-async function rollbackCreatedAccount(params: {
-  projectId: string;
-  databaseId: string;
-  tenantId: string;
-  uid: string;
-  rawAdminToken: string;
-  adminAccessToken: string;
-  createdMemberDoc: boolean;
-  createdUserDoc: boolean;
-  fetchFn: typeof fetch;
-}): Promise<void> {
-  const {
-    projectId,
-    databaseId,
-    tenantId,
-    uid,
-    rawAdminToken,
-    adminAccessToken,
-    createdMemberDoc,
-    createdUserDoc,
-    fetchFn,
-  } = params;
+    const result = await runTransaction(db, async (transaction) => {
+      const [existingSnap, existingSlugSnap, existingOwnerInviteSnap] = await Promise.all([
+        transaction.get(tenantDocRef),
+        slugDocRef ? transaction.get(slugDocRef) : Promise.resolve(null),
+        ownerInviteRef ? transaction.get(ownerInviteRef) : Promise.resolve(null),
+      ]);
 
-  const baseDocUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
-    projectId
-  )}/databases/${encodeURIComponent(databaseId)}/documents`;
-
-  if (createdMemberDoc) {
-    await fetchFn(
-      `${baseDocUrl}/tenants/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(uid)}`,
-      {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${rawAdminToken}` },
+      if (existingSnap.exists()) {
+        throw new Error(`Tenant "${cleanId}" already exists. Duplicate tenant creation rejected.`);
       }
-    ).catch(() => {});
-  }
 
-  if (createdUserDoc) {
-    await fetchFn(`${baseDocUrl}/users/${encodeURIComponent(uid)}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${rawAdminToken}` },
-    }).catch(() => {});
-  }
+      if (existingSlugSnap && existingSlugSnap.exists()) {
+        throw new Error(
+          `Slug "${normalizedSlug}" is already registered to "${existingSlugSnap.data()?.tenantId}". Choose a different public URL slug.`
+        );
+      }
 
-  await fetchFn(
-    `https://identitytoolkit.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/accounts:delete`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${adminAccessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ localId: uid }),
-    }
-  ).catch(() => {});
-}
+      if (
+        existingOwnerInviteSnap &&
+        existingOwnerInviteSnap.exists() &&
+        existingOwnerInviteSnap.data()?.tenantId !== cleanId &&
+        existingOwnerInviteSnap.data()?.status !== 'revoked'
+      ) {
+        throw new Error(
+          `Owner email "${cleanOwnerEmail}" is already assigned to tenant "${existingOwnerInviteSnap.data()?.tenantId}". Use a unique Google email per business.`
+        );
+      }
 
-// ============================================================================
-// 5. Cloudflare Pages Function Handler
-// ============================================================================
+      const payload: Record<string, any> = {
+        id: cleanId,
+        tenantId: cleanId,
+        name: newRecord.businessName,
+        businessName: newRecord.businessName,
+        industry: newRecord.industry,
+        status: newRecord.status,
+        isPublished: newRecord.isPublished,
+        ownerEmail: newRecord.ownerEmail,
+        createdAt: newRecord.createdAt,
+        updatedAt: newRecord.updatedAt,
+      };
+      if (normalizedSlug) {
+        payload.slug = normalizedSlug;
+      }
 
-export async function onRequestOptions(context: PagesContext): Promise<Response> {
-  return new Response(null, {
-    status: 204,
-    headers: getCorsHeaders(context?.request),
-  });
-}
+      transaction.set(tenantDocRef, payload);
 
-export async function handleCreateClientLogin(
-  context: PagesContext,
-  deps?: { fetchFn?: typeof fetch }
-): Promise<Response> {
-  const { request, env } = context;
-  const fetchFn = deps?.fetchFn || fetch;
+      if (slugDocRef && normalizedSlug) {
+        transaction.set(slugDocRef, {
+          slug: normalizedSlug,
+          tenantId: cleanId,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        });
+      }
 
-  // 1. Extract Bearer Token strictly from Authorization header
-  const authHeader = request.headers.get('Authorization') || '';
-  if (!authHeader.startsWith('Bearer ')) {
-    return jsonResponse(
-      { success: false, message: 'Unauthorized: Missing Firebase ID token in Authorization header.' },
-      401,
-      request
-    );
-  }
-  const rawToken = authHeader.slice(7).trim();
-  if (!rawToken) {
-    return jsonResponse(
-      { success: false, message: 'Unauthorized: Empty Bearer token.' },
-      401,
-      request
-    );
-  }
+      if (ownerInviteRef && ownerEmailHash && cleanOwnerEmail) {
+        transaction.set(ownerInviteRef, {
+          emailHash: ownerEmailHash,
+          ownerEmail: cleanOwnerEmail,
+          tenantId: cleanId,
+          businessName: newRecord.businessName,
+          status: 'pending',
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        });
+      }
 
-  // 2. Parse request body safely
-  let body: any = {};
-  try {
-    const text = await request.text();
-    if (text) {
-      body = JSON.parse(text);
-    }
-  } catch {
-    return jsonResponse({ success: false, message: 'Invalid JSON request body.' }, 400, request);
-  }
+      return newRecord;
+    });
 
-  if (!body || typeof body !== 'object') {
-    return jsonResponse({ success: false, message: 'Malformed request body.' }, 400, request);
-  }
-
-  if (body.idToken) {
-    return jsonResponse(
-      { success: false, message: 'Security violation: Bearer tokens must be sent in Authorization header only.' },
-      400,
-      request
-    );
-  }
-
-  if (body.password !== undefined) {
-    return jsonResponse(
-      {
-        success: false,
-        message: 'Security violation: Permanent passwords cannot be submitted. A secure setup link is generated automatically.',
-      },
-      400,
-      request
-    );
-  }
-
-  // 3. Cryptographically verify Firebase ID token
-  const expectedProjectId = (env.FIREBASE_PROJECT_ID || 'bamboo-tangent-x8gvj').trim();
-  const verification = await verifyFirebaseIdToken(rawToken, expectedProjectId, env, fetchFn);
-  if (!verification.isValid || !verification.payload) {
-    return jsonResponse(
-      { success: false, message: `Unauthorized: ${verification.error || 'Token verification failed.'}` },
-      401,
-      request
-    );
-  }
-
-  const payload = verification.payload;
-  const callerUid = String(payload.sub || '').trim();
-  const callerEmail = String(payload.email || '').toLowerCase().trim();
-
-  // 4. Server-authoritative Root Administrator verification (fail-closed)
-  const configuredAdminUid = env.ROOT_ADMIN_UID ? String(env.ROOT_ADMIN_UID).trim() : '';
-  if (!configuredAdminUid) {
-    return jsonResponse(
-      {
-        success: false,
-        code: 'ROOT_ADMIN_UID_MISSING',
-        message: 'Server configuration error: ROOT_ADMIN_UID must be configured in Cloudflare Pages secrets.',
-      },
-      503,
-      request
-    );
-  }
-
-  const isRootAdmin =
-    callerUid === configuredAdminUid &&
-    callerEmail === ROOT_ADMIN_EMAIL &&
-    payload.email_verified === true &&
-    payload.firebase?.sign_in_provider === 'google.com';
-
-  if (!isRootAdmin) {
-    return jsonResponse(
-      {
-        success: false,
-        message: 'Forbidden: Only the verified Root Administrator may create client CRM logins.',
-      },
-      403,
-      request
-    );
-  }
-
-  // 5. Validate input fields
-  const tenantId = String(body.tenantId || '').trim().toLowerCase();
-  const clientName = String(body.clientName || '').trim();
-  const clientEmail = String(body.clientEmail || '').trim().toLowerCase();
-  const requestedRole = body.role === undefined ? 'business_owner' : String(body.role).trim();
-
-  if (!tenantId || !TENANT_ID_REGEX.test(tenantId)) {
-    return jsonResponse({ success: false, message: 'A valid Tenant ID is required.' }, 400, request);
-  }
-  if (clientName.length < 2 || clientName.length > 100) {
-    return jsonResponse(
-      { success: false, message: 'Client name must be between 2 and 100 characters.' },
-      400,
-      request
-    );
-  }
-  if (!clientEmail || clientEmail.length > 150 || !EMAIL_REGEX.test(clientEmail)) {
-    return jsonResponse({ success: false, message: 'A valid client email address is required.' }, 400, request);
-  }
-  if (clientEmail === ROOT_ADMIN_EMAIL) {
-    return jsonResponse(
-      { success: false, message: 'Root Administrator email cannot be assigned as a client login.' },
-      409,
-      request
-    );
-  }
-  if (requestedRole !== 'business_owner') {
-    return jsonResponse(
-      { success: false, message: 'Invalid role: Client CRM logins must use role "business_owner".' },
-      400,
-      request
-    );
-  }
-
-  // 6. Verify Firestore configuration & validate tenant existence + active status
-  const databaseId = env.FIRESTORE_DATABASE_ID ? String(env.FIRESTORE_DATABASE_ID).trim() : '';
-  if (!databaseId) {
-    return jsonResponse(
-      {
-        success: false,
-        message: 'Server configuration error: FIRESTORE_DATABASE_ID is missing from server environment.',
-      },
-      500,
-      request
-    );
-  }
-
-  const firestoreBaseUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
-    expectedProjectId
-  )}/databases/${encodeURIComponent(databaseId)}/documents`;
-
-  const tenantRes = await fetchFn(`${firestoreBaseUrl}/tenants/${encodeURIComponent(tenantId)}`, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${rawToken}`,
-      Accept: 'application/json',
-    },
-  });
-
-  if (tenantRes.status === 404) {
-    return jsonResponse(
-      { success: false, message: `Tenant "${tenantId}" does not exist.` },
-      404,
-      request
-    );
-  }
-  if (!tenantRes.ok) {
-    return jsonResponse(
-      {
-        success: false,
-        message: `Failed to verify tenant "${tenantId}" in Firestore (HTTP ${tenantRes.status}).`,
-      },
-      tenantRes.status === 403 ? 403 : 502,
-      request
-    );
-  }
-
-  const tenantDoc: any = await tenantRes.json().catch(() => ({}));
-  const tenantFields = tenantDoc?.fields || {};
-  const tenantStatus = String(tenantFields.status?.stringValue || '').trim().toLowerCase();
-
-  if (tenantStatus !== 'active') {
-    return jsonResponse(
-      {
-        success: false,
-        message: `Cannot create login: Tenant "${tenantId}" is currently "${tenantStatus || 'inactive'}". Activate the tenant first without auto-activating.`,
-      },
-      409,
-      request
-    );
-  }
-
-  const businessName = String(
-    tenantFields.businessName?.stringValue || tenantFields.name?.stringValue || tenantId
-  )
-    .trim()
-    .slice(0, 150);
-
-  // 7. Check existing tenant members to prevent duplicate owner login on the tenant
-  const membersRes = await fetchFn(
-    `${firestoreBaseUrl}/tenants/${encodeURIComponent(tenantId)}/members?pageSize=100`,
-    {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${rawToken}`,
-        Accept: 'application/json',
-      },
-    }
-  );
-
-  if (!membersRes.ok) {
-    return jsonResponse(
-      {
-        success: false,
-        message: `Could not verify existing tenant members (HTTP ${membersRes.status}).`,
-      },
-      502,
-      request
-    );
-  }
-
-  const membersData: any = await membersRes.json().catch(() => ({}));
-  const existingMembers: any[] = Array.isArray(membersData?.documents) ? membersData.documents : [];
-  for (const docItem of existingMembers) {
-    const f = docItem?.fields || {};
-    const mRole = String(f.role?.stringValue || '').trim().toLowerCase();
-    const mEmail = String(f.email?.stringValue || '').trim().toLowerCase();
-    if (mRole === 'owner') {
-      return jsonResponse(
-        {
-          success: false,
-          code: 'TENANT_OWNER_EXISTS',
-          message: `A Business Owner login (${mEmail || 'existing owner'}) is already created for tenant "${tenantId}".`,
-        },
-        409,
-        request
-      );
-    }
-    if (mEmail && mEmail === clientEmail) {
-      return jsonResponse(
-        {
-          success: false,
-          code: 'MEMBER_EMAIL_EXISTS',
-          message: `Email "${clientEmail}" already has membership in tenant "${tenantId}".`,
-        },
-        409,
-        request
-      );
-    }
-  }
-
-  // 8. Resolve Service Account credentials and mint Google OAuth2 access token
-  const serviceAccount = resolveServiceAccountCredentials(env);
-  if (!serviceAccount) {
-    return jsonResponse(
-      {
-        success: false,
-        code: 'ADMIN_BACKEND_UNCONFIGURED',
-        message:
-          'Firebase Admin credentials are not configured on the server. Add FIREBASE_SERVICE_ACCOUNT_JSON to Cloudflare Pages environment secrets.',
-      },
-      503,
-      request
-    );
-  }
-
-  if (serviceAccount.projectId && serviceAccount.projectId !== expectedProjectId) {
-    return jsonResponse(
-      {
-        success: false,
-        message: 'Server configuration error: Service account project_id does not match FIREBASE_PROJECT_ID.',
-      },
-      500,
-      request
-    );
-  }
-
-  let adminAccessToken: string;
-  try {
-    adminAccessToken = await fetchGoogleAdminAccessToken(serviceAccount, fetchFn);
+    return { success: true, tenant: result };
   } catch (err: any) {
-    return jsonResponse(
-      {
-        success: false,
-        message: `Failed to authenticate Firebase Admin service account: ${err?.message || 'OAuth error'}`,
-      },
-      502,
-      request
-    );
+    return { success: false, error: err?.message || 'Failed to create tenant record in Firestore.' };
+  }
+}
+
+/**
+ * Update tenant status (active | suspended) in Firestore (Root Administrator only).
+ * Uses updateDoc so only existing tenant documents can be updated and only status + updatedAt are changed.
+ */
+export async function updateTenantStatus(
+  tenantId: string,
+  status: TenantStatus
+): Promise<{ success: boolean; error?: string }> {
+  const cleanId = (tenantId || '').trim().toLowerCase();
+  if (!cleanId || !/^[a-z0-9_-]+$/.test(cleanId)) {
+    return { success: false, error: 'A valid Tenant ID is required.' };
+  }
+  if (status !== 'active' && status !== 'suspended') {
+    return { success: false, error: 'Invalid tenant status. Must be "active" or "suspended".' };
   }
 
-  const idpBaseUrl = `https://identitytoolkit.googleapis.com/v1/projects/${encodeURIComponent(expectedProjectId)}`;
-
-  // 9. Prevent duplicate or cross-tenant accounts by checking Firebase Auth first
-  const lookupRes = await fetchFn(`${idpBaseUrl}/accounts:lookup`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${adminAccessToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ email: [clientEmail] }),
-  });
-
-  if (!lookupRes.ok) {
-    const errJson = await lookupRes.json().catch(() => ({}));
-    return jsonResponse(
-      {
-        success: false,
-        message: `Firebase Auth lookup failed: ${parseIdentityToolkitError(errJson, `HTTP ${lookupRes.status}`)}`,
-      },
-      502,
-      request
-    );
+  const timestamp = new Date().toISOString();
+  try {
+    const tenantRef = doc(db, 'tenants', cleanId);
+    await updateDoc(tenantRef, { status, updatedAt: timestamp });
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Failed to update tenant status.' };
   }
+}
 
-  const lookupJson: any = await lookupRes.json().catch(() => ({}));
-  if (Array.isArray(lookupJson?.users) && lookupJson.users.length > 0) {
-    return jsonResponse(
-      {
-        success: false,
-        code: 'EMAIL_ALREADY_EXISTS',
-        message: `An account with email "${clientEmail}" already exists in Firebase Authentication. Use a unique email address to avoid duplicate or cross-tenant accounts.`,
-      },
-      409,
-      request
-    );
+/**
+ * Update tenant publish state in Firestore (Administrator only)
+ */
+export async function updateTenantPublishState(
+  tenantId: string,
+  isPublished: boolean
+): Promise<{ success: boolean; error?: string }> {
+  const cleanId = (tenantId || '').trim().toLowerCase();
+  if (!cleanId) return { success: false, error: 'Tenant ID is required.' };
+
+  const timestamp = new Date().toISOString();
+  try {
+    const tenantRef = doc(db, 'tenants', cleanId);
+    await setDoc(tenantRef, { isPublished, updatedAt: timestamp }, { merge: true });
+
+    // Keep public website document in sync if present
+    const websiteRef = doc(db, 'tenants', cleanId, 'public', 'website');
+    await setDoc(websiteRef, { isPublished, updatedAt: timestamp }, { merge: true });
+
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Failed to update publication state.' };
   }
+}
 
-  // 10. Create the client user in Firebase Authentication (no permanent plaintext password)
-  const createUserRes = await fetchFn(`${idpBaseUrl}/accounts`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${adminAccessToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      email: clientEmail,
-      displayName: clientName,
-      emailVerified: false,
-      disabled: false,
-    }),
-  });
+/**
+ * Save in-progress website working draft at /tenants/{tenantId}/private/websiteDraft (Root Admin only)
+ * CRITICAL REQUIREMENT: This writes ONLY to the private draft document.
+ * The live public document at /tenants/{tenantId}/public/website is NEVER touched.
+ */
+export async function saveTenantWebsiteDraft(
+  tenantId: string,
+  config: Partial<ClientConfig>
+): Promise<{ success: boolean; error?: string }> {
+  const cleanId = (tenantId || '').trim().toLowerCase();
+  if (!cleanId) return { success: false, error: 'Tenant ID is required.' };
 
-  const createUserJson: any = await createUserRes.json().catch(() => ({}));
-  if (!createUserRes.ok || !createUserJson?.localId) {
-    const errMsg = parseIdentityToolkitError(createUserJson, `HTTP ${createUserRes.status}`);
-    const isDuplicate = errMsg.toUpperCase().includes('EMAIL_EXISTS');
-    return jsonResponse(
-      {
-        success: false,
-        code: isDuplicate ? 'EMAIL_ALREADY_EXISTS' : 'AUTH_CREATE_FAILED',
-        message: isDuplicate
-          ? `An account with email "${clientEmail}" already exists in Firebase Authentication.`
-          : `Failed to create Firebase Auth user: ${errMsg}`,
-      },
-      isDuplicate ? 409 : 502,
-      request
-    );
+  const timestamp = new Date().toISOString();
+  try {
+    const draftRef = doc(db, 'tenants', cleanId, 'private', 'websiteDraft');
+    const payload = {
+      tenantId: cleanId,
+      businessName: config.businessName || cleanId,
+      updatedAt: timestamp,
+      config: JSON.parse(JSON.stringify(config)),
+    };
+    await setDoc(draftRef, payload, { merge: true });
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Failed to save website draft.' };
   }
+}
 
-  const newUid = String(createUserJson.localId).trim();
-  const nowIso = new Date().toISOString();
-  let createdUserDoc = false;
-  let createdMemberDoc = false;
+/**
+ * Load website configuration for editing (Root Admin only):
+ * 1. Checks /tenants/{tenantId}/private/websiteDraft first.
+ * 2. If missing, falls back to the existing live /tenants/{tenantId}/public/website.
+ * 3. Does NOT modify the live website during loading.
+ */
+export async function fetchTenantWebsiteDraft(
+  tenantId: string
+): Promise<{
+  success: boolean;
+  config: Partial<ClientConfig> | null;
+  source: 'draft' | 'public' | 'none';
+  isPublished: boolean;
+  error?: string;
+}> {
+  const cleanId = (tenantId || '').trim().toLowerCase();
+  if (!cleanId) return { success: false, config: null, source: 'none', isPublished: false, error: 'Invalid tenant ID' };
 
   try {
-    // 11a. Store tenantId and role ('owner') in /users/{uid} conforming to firestore.rules isValidUserProfile
-    const userWriteRes = await fetchFn(
-      `${firestoreBaseUrl}/users?documentId=${encodeURIComponent(newUid)}`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${rawToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          fields: {
-            uid: { stringValue: newUid },
-            email: { stringValue: clientEmail },
-            displayName: { stringValue: clientName },
-            businessName: { stringValue: businessName },
-            tenantId: { stringValue: tenantId },
-            role: { stringValue: 'owner' },
-            createdAt: { stringValue: nowIso },
-          },
-        }),
-      }
-    );
-
-    if (!userWriteRes.ok) {
-      const errBody = await userWriteRes.text().catch(() => '');
-      throw new Error(`Failed to write user profile in Firestore (HTTP ${userWriteRes.status}): ${errBody}`);
+    // 1. Check private working draft
+    const draftRef = doc(db, 'tenants', cleanId, 'private', 'websiteDraft');
+    const draftSnap = await getDoc(draftRef);
+    if (draftSnap.exists() && draftSnap.data()?.config) {
+      // Also check tenant's published flag
+      const tenantRec = await getTenantRecord(cleanId);
+      return {
+        success: true,
+        config: draftSnap.data().config as Partial<ClientConfig>,
+        source: 'draft',
+        isPublished: Boolean(tenantRec?.isPublished),
+      };
     }
-    createdUserDoc = true;
 
-    // 11b. Store membership in /tenants/{tenantId}/members/{uid} conforming to firestore.rules isValidMemberData
-    const memberWriteRes = await fetchFn(
-      `${firestoreBaseUrl}/tenants/${encodeURIComponent(tenantId)}/members?documentId=${encodeURIComponent(newUid)}`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${rawToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          fields: {
-            uid: { stringValue: newUid },
-            email: { stringValue: clientEmail },
-            role: { stringValue: 'owner' },
-            addedAt: { stringValue: nowIso },
-          },
-        }),
-      }
-    );
-
-    if (!memberWriteRes.ok) {
-      const errBody = await memberWriteRes.text().catch(() => '');
-      throw new Error(`Failed to write tenant membership in Firestore (HTTP ${memberWriteRes.status}): ${errBody}`);
+    // 2. Fall back to existing public website document
+    const publicRef = doc(db, 'tenants', cleanId, 'public', 'website');
+    const publicSnap = await getDoc(publicRef);
+    if (publicSnap.exists() && publicSnap.data()?.config) {
+      const publicData = publicSnap.data();
+      return {
+        success: true,
+        config: publicData.config as Partial<ClientConfig>,
+        source: 'public',
+        isPublished: Boolean(publicData.isPublished),
+      };
     }
-    createdMemberDoc = true;
 
-    // 12. Generate a secure one-time password setup link WITHOUT sending email (returnOobLink: true)
-    const continueUrl = buildContinueUrl(request, tenantId);
-    const oobRequestBody: Record<string, any> = {
-      requestType: 'PASSWORD_RESET',
-      email: clientEmail,
-      returnOobLink: true,
-      ...(continueUrl ? { continueUrl } : {}),
+    // 3. Neither exists
+    const tenantRec = await getTenantRecord(cleanId);
+    return {
+      success: true,
+      config: null,
+      source: 'none',
+      isPublished: Boolean(tenantRec?.isPublished),
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      config: null,
+      source: 'none',
+      isPublished: false,
+      error: err?.message || 'Could not load website draft configuration.',
+    };
+  }
+}
+
+/**
+ * Atomically publish a tenant's website (Root Admin only)
+ * Requirements:
+ * 1. Verifies tenant document status is strictly 'active'. Suspended tenants can NEVER be published.
+ * 2. Uses Firestore writeBatch() to commit updates to /tenants/{tenantId} and /tenants/{tenantId}/public/website atomically.
+ * 3. Never mutates tenant 'status' (status remains active, never touches suspended).
+ * 4. Also persists the current draft in /tenants/{tenantId}/private/websiteDraft atomically.
+ */
+export async function publishTenantWebsiteAtomic(
+  tenantId: string,
+  config: Partial<ClientConfig>
+): Promise<{ success: boolean; error?: string }> {
+  const cleanId = (tenantId || '').trim().toLowerCase();
+  if (!cleanId) return { success: false, error: 'Tenant ID is required.' };
+
+  try {
+    // Pre-flight check: Verify tenant exists and status is strictly 'active'
+    const tenantRec = await getTenantRecord(cleanId);
+    if (!tenantRec) {
+      return { success: false, error: `Tenant "${cleanId}" does not exist.` };
+    }
+    if (tenantRec.status !== 'active') {
+      return {
+        success: false,
+        error: `Publishing blocked: Tenant account status is "${tenantRec.status}". Only active tenants can be published. Suspended tenants cannot be published.`,
+      };
+    }
+
+    const timestamp = new Date().toISOString();
+    const cleanConfig = JSON.parse(JSON.stringify(config));
+
+    // Construct atomic batch
+    const batch = writeBatch(db);
+
+    // 1. Update /tenants/{tenantId} publication flag
+    const tenantRef = doc(db, 'tenants', cleanId);
+    batch.update(tenantRef, {
+      isPublished: true,
+      updatedAt: timestamp,
+    });
+
+    // 2. Set /tenants/{tenantId}/public/website live configuration
+    const publicWebsiteRef = doc(db, 'tenants', cleanId, 'public', 'website');
+    batch.set(publicWebsiteRef, {
+      tenantId: cleanId,
+      businessName: config.businessName || tenantRec.businessName || cleanId,
+      isPublished: true,
+      updatedAt: timestamp,
+      config: cleanConfig,
+    }, { merge: true });
+
+    // 3. Keep /tenants/{tenantId}/private/websiteDraft in sync
+    const draftRef = doc(db, 'tenants', cleanId, 'private', 'websiteDraft');
+    batch.set(draftRef, {
+      tenantId: cleanId,
+      businessName: config.businessName || tenantRec.businessName || cleanId,
+      updatedAt: timestamp,
+      config: cleanConfig,
+    }, { merge: true });
+
+    // Commit atomic batch in a single network round-trip
+    await batch.commit();
+
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Failed to publish website atomically.' };
+  }
+}
+
+/**
+ * Atomically unpublish a tenant's website (Root Admin only)
+ * Requirements:
+ * 1. Uses Firestore writeBatch() to update isPublished: false on /tenants/{tenantId} and /tenants/{tenantId}/public/website.
+ * 2. Non-destructive: Fully preserves all website configuration.
+ */
+export async function unpublishTenantWebsiteAtomic(
+  tenantId: string
+): Promise<{ success: boolean; error?: string }> {
+  const cleanId = (tenantId || '').trim().toLowerCase();
+  if (!cleanId) return { success: false, error: 'Tenant ID is required.' };
+
+  try {
+    const timestamp = new Date().toISOString();
+    const batch = writeBatch(db);
+
+    // 1. Update tenant root document
+    const tenantRef = doc(db, 'tenants', cleanId);
+    batch.update(tenantRef, {
+      isPublished: false,
+      updatedAt: timestamp,
+    });
+
+    // 2. Update public website document
+    const publicWebsiteRef = doc(db, 'tenants', cleanId, 'public', 'website');
+    batch.set(publicWebsiteRef, {
+      isPublished: false,
+      updatedAt: timestamp,
+    }, { merge: true });
+
+    await batch.commit();
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Failed to unpublish website atomically.' };
+  }
+}
+
+/**
+ * Persist public website presentation configuration at /tenants/{tenantId}/public/website (Administrator only)
+ * Retained for backward-compatibility.
+ */
+export async function saveTenantWebsiteConfig(
+  tenantId: string,
+  config: Partial<ClientConfig>,
+  isPublished: boolean = true
+): Promise<{ success: boolean; error?: string }> {
+  const cleanId = (tenantId || '').trim().toLowerCase();
+  if (!cleanId) return { success: false, error: 'Tenant ID is required.' };
+
+  const timestamp = new Date().toISOString();
+  try {
+    const websiteRef = doc(db, 'tenants', cleanId, 'public', 'website');
+    const payload = {
+      tenantId: cleanId,
+      businessName: config.businessName || cleanId,
+      isPublished,
+      updatedAt: timestamp,
+      config: JSON.parse(JSON.stringify(config)),
+    };
+    await setDoc(websiteRef, payload, { merge: true });
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Failed to save website configuration.' };
+  }
+}
+
+/**
+ * Fetch public website configuration from /tenants/{tenantId}/public/website for public visitors
+ */
+export async function fetchPublicWebsiteConfig(
+  tenantId: string
+): Promise<{
+  success: boolean;
+  config: Partial<ClientConfig> | null;
+  isPublished: boolean;
+  businessName?: string;
+  error?: string;
+}> {
+  const cleanId = (tenantId || '').trim().toLowerCase();
+  if (!cleanId) return { success: false, config: null, isPublished: false, error: 'Invalid tenant ID' };
+
+  try {
+    const websiteRef = doc(db, 'tenants', cleanId, 'public', 'website');
+    const snap = await getDoc(websiteRef);
+    if (!snap.exists()) {
+      return { success: false, config: null, isPublished: false, error: 'Website configuration not found.' };
+    }
+    const data = snap.data();
+    if (data?.tenantId && String(data.tenantId).trim().toLowerCase() !== cleanId) {
+      return {
+        success: false,
+        config: null,
+        isPublished: false,
+        error: 'Website configuration tenant mismatch.',
+      };
+    }
+    return {
+      success: true,
+      config: (data.config as Partial<ClientConfig>) || null,
+      isPublished: Boolean(data.isPublished),
+      businessName: typeof data.businessName === 'string' ? data.businessName : undefined,
+    };
+  } catch (err: any) {
+    return { success: false, config: null, isPublished: false, error: err?.message || 'Could not load website configuration.' };
+  }
+}
+
+/**
+ * Compute lowercase hex SHA-256 hash of an email address for deterministic invite lookups.
+ * Runs in all modern browsers via window.crypto.subtle (fallback to lightweight JS if unavailable).
+ */
+export async function computeEmailHash(email: string): Promise<string> {
+  const clean = (email || '').trim().toLowerCase();
+  if (!clean) return '';
+
+  try {
+    if (typeof window !== 'undefined' && window.crypto && window.crypto.subtle) {
+      const msgBuffer = new TextEncoder().encode(clean);
+      const hashBuffer = await window.crypto.subtle.digest('SHA-256', msgBuffer);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+    }
+  } catch (err) {
+    console.warn('Web Crypto unavailable, falling back to deterministic string hash:', err);
+  }
+
+  // Fallback deterministic alphanumeric slug
+  let hash = 0;
+  for (let i = 0; i < clean.length; i++) {
+    hash = ((hash << 5) - hash) + clean.charCodeAt(i);
+    hash |= 0;
+  }
+  return `hash_${Math.abs(hash).toString(16)}_${clean.replace(/[^a-z0-9]/g, '').slice(0, 20)}`;
+}
+
+export interface TenantStaffInvite {
+  email: string;
+  emailHash: string;
+  role: 'staff';
+  status: 'pending' | 'claimed' | 'revoked';
+  tenantId: string;
+  invitedBy: string;
+  createdAt: string;
+  expiresAt: string;
+  claimedBy?: string;
+  claimedAt?: string;
+}
+
+export interface TenantMemberRecord {
+  uid: string;
+  email: string;
+  role: 'owner' | 'staff';
+  addedAt?: string;
+}
+
+/**
+ * Create a staff invitation at /tenants/{tenantId}/invites/{emailHash} (Tenant Owner only)
+ * Requirements:
+ * - Role is strictly 'staff'
+ * - Expires in 7 days (safe server-time window: expiresAt > request.time && expiresAt <= request.time + 7d)
+ * - Single pending invite per email
+ */
+export async function createStaffInvite(
+  tenantId: string,
+  staffEmail: string
+): Promise<{ success: boolean; invite?: TenantStaffInvite; inviteLink?: string; error?: string }> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  const cleanEmail = (staffEmail || '').trim().toLowerCase();
+
+  if (!cleanTenant) return { success: false, error: 'Tenant ID is required.' };
+  if (!cleanEmail || !cleanEmail.includes('@')) {
+    return { success: false, error: 'A valid email address is required.' };
+  }
+
+  const currentUser = auth.currentUser;
+  if (!currentUser) {
+    return { success: false, error: 'Authentication required to invite team members.' };
+  }
+
+  try {
+    const emailHash = await computeEmailHash(cleanEmail);
+    const inviteRef = doc(db, 'tenants', cleanTenant, 'invites', emailHash);
+
+    // Check if an invite already exists
+    const existingSnap = await getDoc(inviteRef);
+    if (existingSnap.exists()) {
+      const data = existingSnap.data();
+      if (data.status === 'pending') {
+        const expiresAtMillis = data.expiresAt?.toMillis ? data.expiresAt.toMillis() : new Date(data.expiresAt).getTime();
+        if (Date.now() < expiresAtMillis) {
+          const origin = typeof window !== 'undefined' ? window.location.origin : '';
+          const inviteLink = `${origin}/?target=crm&inviteTenant=${encodeURIComponent(cleanTenant)}&inviteHash=${encodeURIComponent(emailHash)}`;
+          return {
+            success: false,
+            error: `An active invitation already exists for "${cleanEmail}".`,
+            inviteLink,
+          };
+        }
+      }
+    }
+
+    // Set expiry 7 days in the future (minus 1 min buffer to safely ensure <= request.time + 7 days)
+    const nowMillis = Date.now();
+    const sevenDaysFromNow = Timestamp.fromMillis(nowMillis + (7 * 24 * 60 * 60 * 1000) - 60000);
+
+    const payload = {
+      email: cleanEmail,
+      emailHash,
+      role: 'staff' as const,
+      status: 'pending' as const,
+      tenantId: cleanTenant,
+      invitedBy: currentUser.uid,
+      createdAt: serverTimestamp(),
+      expiresAt: sevenDaysFromNow,
     };
 
-    let oobRes = await fetchFn(`${idpBaseUrl}/accounts:sendOobCode`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${adminAccessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(oobRequestBody),
-    });
+    await setDoc(inviteRef, payload);
 
-    let oobJson: any = await oobRes.json().catch(() => ({}));
-    if (
-      !oobRes.ok &&
-      continueUrl &&
-      parseIdentityToolkitError(oobJson, '').toUpperCase().includes('UNAUTHORIZED_DOMAIN')
-    ) {
-      oobRes = await fetchFn(`${idpBaseUrl}/accounts:sendOobCode`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${adminAccessToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          requestType: 'PASSWORD_RESET',
-          email: clientEmail,
-          returnOobLink: true,
-        }),
-      });
-      oobJson = await oobRes.json().catch(() => ({}));
-    }
+    const origin = typeof window !== 'undefined' ? window.location.origin : '';
+    const inviteLink = `${origin}/?target=crm&inviteTenant=${encodeURIComponent(cleanTenant)}&inviteHash=${encodeURIComponent(emailHash)}`;
 
-    if (!oobRes.ok || !oobJson?.oobLink) {
-      throw new Error(
-        `Failed to generate password setup link: ${parseIdentityToolkitError(oobJson, `HTTP ${oobRes.status}`)}`
-      );
-    }
+    const inviteObj: TenantStaffInvite = {
+      email: cleanEmail,
+      emailHash,
+      role: 'staff',
+      status: 'pending',
+      tenantId: cleanTenant,
+      invitedBy: currentUser.uid,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(sevenDaysFromNow.toMillis()).toISOString(),
+    };
 
-    return jsonResponse(
-      {
-        success: true,
-        uid: newUid,
-        tenantId,
-        businessName,
-        clientName,
-        clientEmail,
-        role: 'business_owner',
-        firestoreRole: 'owner',
-        loginStatus: 'created',
-        setupLink: String(oobJson.oobLink),
-        emailSent: false,
-        message:
-          'Client CRM login created. Copy and share the one-time password setup link securely with the business owner.',
-      },
-      200,
-      request
-    );
+    return { success: true, invite: inviteObj, inviteLink };
   } catch (err: any) {
-    await rollbackCreatedAccount({
-      projectId: expectedProjectId,
-      databaseId,
-      tenantId,
-      uid: newUid,
-      rawAdminToken: rawToken,
-      adminAccessToken,
-      createdMemberDoc,
-      createdUserDoc,
-      fetchFn,
+    return { success: false, error: err?.message || 'Failed to create staff invitation in Firestore.' };
+  }
+}
+
+/**
+ * Revoke a pending staff invitation (Tenant Owner only)
+ * Requirements:
+ * - Only pending invites can be revoked
+ * - Mutates strictly the status field (affectedKeys().hasOnly(['status']))
+ */
+export async function revokeStaffInvite(
+  tenantId: string,
+  emailHash: string
+): Promise<{ success: boolean; error?: string }> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  const cleanHash = (emailHash || '').trim();
+
+  if (!cleanTenant || !cleanHash) {
+    return { success: false, error: 'Tenant ID and invite hash are required.' };
+  }
+
+  try {
+    const inviteRef = doc(db, 'tenants', cleanTenant, 'invites', cleanHash);
+    await runTransaction(db, async (txn) => {
+      const snap = await txn.get(inviteRef);
+      if (!snap.exists()) {
+        throw new Error('Invitation document not found.');
+      }
+      if (snap.data().status !== 'pending') {
+        throw new Error(`Cannot revoke invitation with status "${snap.data().status}".`);
+      }
+      txn.update(inviteRef, { status: 'revoked' });
+    });
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Failed to revoke staff invitation.' };
+  }
+}
+
+/**
+ * Atomically claim an invitation and enroll as staff member (Verified Invited User only)
+ * Requirements:
+ * - Verified email must match invite.email
+ * - Request time must be strictly before expiresAt
+ * - Atomic transaction writes /tenants/{tenantId}/members/{user.uid} and updates invite to 'claimed'
+ */
+export async function claimStaffInviteAtomic(
+  tenantId: string,
+  emailHash: string
+): Promise<{ success: boolean; tenantId?: string; role?: 'staff'; error?: string }> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  const cleanHash = (emailHash || '').trim();
+
+  if (!cleanTenant || !cleanHash) {
+    return { success: false, error: 'Tenant ID and invitation hash are required.' };
+  }
+
+  const currentUser = auth.currentUser;
+  if (!currentUser) {
+    return { success: false, error: 'You must be signed in to claim this invitation.' };
+  }
+
+  const userEmail = (currentUser.email || '').trim().toLowerCase();
+  if (!userEmail) {
+    return { success: false, error: 'Authenticated account has no email address.' };
+  }
+
+  try {
+    const inviteRef = doc(db, 'tenants', cleanTenant, 'invites', cleanHash);
+    const memberRef = doc(db, 'tenants', cleanTenant, 'members', currentUser.uid);
+    const userProfileRef = doc(db, 'users', currentUser.uid);
+
+    await runTransaction(db, async (txn) => {
+      // 1. Read invite document
+      const inviteSnap = await txn.get(inviteRef);
+      if (!inviteSnap.exists()) {
+        throw new Error('Invitation not found or invalid link.');
+      }
+
+      const inviteData = inviteSnap.data();
+      if (inviteData.status !== 'pending') {
+        throw new Error(`This invitation has already been ${inviteData.status}.`);
+      }
+
+      // 2. Email verification match
+      if ((inviteData.email || '').toLowerCase().trim() !== userEmail) {
+        throw new Error(
+          `Email mismatch: You are signed in as "${userEmail}", but this invitation was issued to "${inviteData.email}". Please sign in with the invited email address.`
+        );
+      }
+
+      // 3. Expiry check
+      const expiresAtMillis = inviteData.expiresAt?.toMillis
+        ? inviteData.expiresAt.toMillis()
+        : new Date(inviteData.expiresAt).getTime();
+      if (Date.now() >= expiresAtMillis) {
+        throw new Error('This invitation has expired. Please ask your organization owner for a new invite link.');
+      }
+
+      // 4. Atomic writes: Create member record and mark invite as claimed
+      txn.set(memberRef, {
+        uid: currentUser.uid,
+        email: userEmail,
+        role: 'staff',
+        inviteHash: cleanHash,
+        addedAt: new Date().toISOString(),
+      });
+
+      txn.update(inviteRef, {
+        status: 'claimed',
+        claimedBy: currentUser.uid,
+        claimedAt: serverTimestamp(),
+      });
+
+      // 5. Update user profile with assigned tenant and staff role
+      txn.set(
+        userProfileRef,
+        {
+          uid: currentUser.uid,
+          email: userEmail,
+          tenantId: cleanTenant,
+          role: 'staff',
+        },
+        { merge: true }
+      );
     });
 
-    return jsonResponse(
-      {
-        success: false,
-        message: err?.message || 'Failed to complete client login provisioning; changes were rolled back.',
-      },
-      502,
-      request
-    );
+    // Refresh active session cache
+    if (activeSessionUser) {
+      activeSessionUser.clientId = cleanTenant;
+      activeSessionUser.role = 'client_staff';
+    }
+
+    return { success: true, tenantId: cleanTenant, role: 'staff' };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Failed to claim invitation.' };
   }
 }
 
-export async function onRequestPost(context: PagesContext): Promise<Response> {
-  return handleCreateClientLogin(context);
+/**
+ * List all active staff and owner members of a tenant (/tenants/{tenantId}/members)
+ */
+export async function listTenantMembers(tenantId: string): Promise<TenantMemberRecord[]> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  if (!cleanTenant) return [];
+
+  try {
+    const snap = await getDocs(collection(db, 'tenants', cleanTenant, 'members'));
+    const members: TenantMemberRecord[] = [];
+    snap.forEach((d) => {
+      const data = d.data();
+      members.push({
+        uid: data.uid || d.id,
+        email: data.email || '',
+        role: data.role === 'owner' ? 'owner' : 'staff',
+        addedAt: data.addedAt,
+      });
+    });
+    return members;
+  } catch (err) {
+    console.warn(`Could not list members for ${cleanTenant}:`, err);
+    return [];
+  }
 }
 
-export async function onRequest(context: PagesContext): Promise<Response> {
-  if (context.request.method === 'OPTIONS') {
-    return onRequestOptions(context);
-  }
-  if (context.request.method === 'POST') {
-    return onRequestPost(context);
-  }
-  return jsonResponse({ success: false, message: 'Method Not Allowed' }, 405, context.request);
+export interface TenantOwnerLoginInfo {
+  connected: boolean;
+  uid?: string;
+  email?: string;
+  pendingEmail?: string;
+  role: 'owner';
+  addedAt?: string;
 }
+
+/**
+ * Inspect /tenants/{tenantId}/members and tenant record to determine whether a Business Owner
+ * has already connected via Google Sign-In or has a pending approved Google email.
+ */
+export async function getTenantOwnerLoginInfo(
+  tenantOrId: string | TenantRecord
+): Promise<TenantOwnerLoginInfo> {
+  const tenantId = typeof tenantOrId === 'string' ? tenantOrId : tenantOrId.tenantId;
+  const tenantRecord = typeof tenantOrId === 'string' ? null : tenantOrId;
+  const members = await listTenantMembers(tenantId);
+  const owner = members.find((m) => m.role === 'owner');
+  if (owner) {
+    return {
+      connected: true,
+      uid: owner.uid,
+      email: owner.email || tenantRecord?.ownerEmail,
+      role: 'owner',
+      addedAt: owner.addedAt,
+    };
+  }
+  if (tenantRecord?.ownerUid) {
+    return {
+      connected: true,
+      uid: tenantRecord.ownerUid,
+      email: tenantRecord.ownerEmail,
+      role: 'owner',
+    };
+  }
+  return {
+    connected: false,
+    pendingEmail: tenantRecord?.ownerEmail ? tenantRecord.ownerEmail.trim().toLowerCase() : undefined,
+    role: 'owner',
+  };
+}
+
+/**
+ * Ensure a pending /ownerInvites/{emailHash} index record exists for a tenant that already
+ * has an approved ownerEmail but hasn't yet been claimed (e.g., legacy tenants created earlier).
+ * Restricted to verified Root Admin.
+ */
+export async function ensurePendingOwnerInvite(tenant: TenantRecord): Promise<void> {
+  const cleanTenant = (tenant.tenantId || '').trim().toLowerCase();
+  const cleanEmail = (tenant.ownerEmail || '').trim().toLowerCase();
+  if (!cleanTenant || !cleanEmail || cleanEmail === ROOT_ADMIN_EMAIL || tenant.ownerUid) {
+    return;
+  }
+
+  try {
+    const emailHash = await computeEmailHash(cleanEmail);
+    if (!emailHash) return;
+    const inviteRef = doc(db, 'ownerInvites', emailHash);
+    const snap = await getDoc(inviteRef);
+    if (!snap.exists()) {
+      const timestamp = new Date().toISOString();
+      await setDoc(inviteRef, {
+        emailHash,
+        ownerEmail: cleanEmail,
+        tenantId: cleanTenant,
+        businessName: tenant.businessName || cleanTenant,
+        status: 'pending',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+    }
+  } catch (err) {
+    console.warn(`Could not sync owner invite index for ${cleanTenant}:`, err);
+  }
+}
+
+/**
+ * Assign or update the approved Google owner email for an unclaimed tenant (Root Admin only).
+ * Atomically updates /tenants/{tenantId}.ownerEmail and /ownerInvites/{sha256(email)},
+ * retiring any previous pending owner invite and blocking overwrites of already-claimed tenants.
+ */
+export async function assignTenantOwnerEmail(
+  tenantId: string,
+  ownerEmail: string
+): Promise<{ success: boolean; ownerEmail?: string; error?: string }> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  const cleanEmail = (ownerEmail || '').trim().toLowerCase();
+
+  if (!cleanTenant || !/^[a-z0-9_-]{1,128}$/.test(cleanTenant)) {
+    return { success: false, error: 'A valid Tenant ID is required.' };
+  }
+  if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    return { success: false, error: 'Please enter a valid Google email address.' };
+  }
+  if (cleanEmail === ROOT_ADMIN_EMAIL) {
+    return { success: false, error: 'Root Administrator email cannot be assigned as a client owner.' };
+  }
+
+  const currentUser = auth.currentUser;
+  if (!currentUser || !(await verifyRootAdminStatus(currentUser))) {
+    return {
+      success: false,
+      error: 'Action rejected: Only the verified Root Administrator may assign client owner emails.',
+    };
+  }
+
+  // Block reassigning if an owner member already exists
+  const existingMembers = await listTenantMembers(cleanTenant);
+  const connectedOwner = existingMembers.find((m) => m.role === 'owner');
+  if (connectedOwner) {
+    return {
+      success: false,
+      error: `This tenant is already connected to owner "${connectedOwner.email || connectedOwner.uid}". Already-claimed tenants cannot be reassigned here.`,
+    };
+  }
+
+  try {
+    const newEmailHash = await computeEmailHash(cleanEmail);
+    const tenantRef = doc(db, 'tenants', cleanTenant);
+    const newInviteRef = doc(db, 'ownerInvites', newEmailHash);
+    const timestamp = new Date().toISOString();
+
+    await runTransaction(db, async (txn) => {
+      const [tenantSnap, newInviteSnap] = await Promise.all([
+        txn.get(tenantRef),
+        txn.get(newInviteRef),
+      ]);
+
+      if (!tenantSnap.exists()) {
+        throw new Error(`Tenant "${cleanTenant}" was not found.`);
+      }
+
+      const tenantData = tenantSnap.data();
+      if (tenantData.ownerUid) {
+        throw new Error(
+          `Tenant "${cleanTenant}" has already been claimed by an owner account and cannot be overwritten.`
+        );
+      }
+
+      if (newInviteSnap.exists()) {
+        const invData = newInviteSnap.data();
+        if (invData.tenantId !== cleanTenant && invData.status !== 'revoked') {
+          throw new Error(
+            `Email "${cleanEmail}" is already assigned to tenant "${invData.tenantId}". Each Google account can only be assigned as owner of one business.`
+          );
+        }
+        if (invData.tenantId === cleanTenant && invData.status === 'claimed') {
+          throw new Error(`Owner access has already been claimed for "${cleanEmail}".`);
+        }
+      }
+
+      const previousEmail = (tenantData.ownerEmail || '').trim().toLowerCase();
+      const oldEmailHash =
+        previousEmail && previousEmail !== cleanEmail
+          ? await computeEmailHash(previousEmail)
+          : '';
+      const oldInviteRef = oldEmailHash ? doc(db, 'ownerInvites', oldEmailHash) : null;
+      const oldInviteSnap = oldInviteRef ? await txn.get(oldInviteRef) : null;
+
+      if (oldInviteRef && oldInviteSnap && oldInviteSnap.exists()) {
+        const oldData = oldInviteSnap.data();
+        if (oldData.tenantId === cleanTenant) {
+          if (oldData.status === 'claimed') {
+            throw new Error(
+              `Previous owner "${previousEmail}" already claimed access and cannot be replaced.`
+            );
+          }
+          txn.delete(oldInviteRef);
+        }
+      }
+
+      txn.update(tenantRef, {
+        ownerEmail: cleanEmail,
+        updatedAt: timestamp,
+      });
+
+      const businessName = tenantData.name || tenantData.businessName || cleanTenant;
+      if (newInviteSnap.exists()) {
+        txn.update(newInviteRef, {
+          ownerEmail: cleanEmail,
+          businessName,
+          status: 'pending',
+          updatedAt: timestamp,
+        });
+      } else {
+        txn.set(newInviteRef, {
+          emailHash: newEmailHash,
+          ownerEmail: cleanEmail,
+          tenantId: cleanTenant,
+          businessName,
+          status: 'pending',
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        });
+      }
+    });
+
+    return { success: true, ownerEmail: cleanEmail };
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err?.message || 'Failed to update approved owner Google email.',
+    };
+  }
+}
+
+/**
+ * List all pending staff invitations for a tenant (/tenants/{tenantId}/invites)
+ */
+export async function listTenantInvites(tenantId: string): Promise<TenantStaffInvite[]> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  if (!cleanTenant) return [];
+
+  try {
+    const snap = await getDocs(collection(db, 'tenants', cleanTenant, 'invites'));
+    const list: TenantStaffInvite[] = [];
+    snap.forEach((d) => {
+      const data = d.data();
+      const expiresAtStr = data.expiresAt?.toMillis
+        ? new Date(data.expiresAt.toMillis()).toISOString()
+        : String(data.expiresAt || '');
+      list.push({
+        email: data.email || '',
+        emailHash: data.emailHash || d.id,
+        role: 'staff',
+        status: data.status || 'pending',
+        tenantId: cleanTenant,
+        invitedBy: data.invitedBy || '',
+        createdAt: data.createdAt?.toMillis
+          ? new Date(data.createdAt.toMillis()).toISOString()
+          : String(data.createdAt || ''),
+        expiresAt: expiresAtStr,
+        claimedBy: data.claimedBy,
+        claimedAt: data.claimedAt?.toMillis
+          ? new Date(data.claimedAt.toMillis()).toISOString()
+          : String(data.claimedAt || ''),
+      });
+    });
+    return list;
+  } catch (err) {
+    console.warn(`Could not list invites for ${cleanTenant}:`, err);
+    return [];
+  }
+}
+
+/**
+ * Remove a staff member from a tenant (Tenant Owner or Root Admin only)
+ * Rules prohibit removing owners or self-deletion.
+ */
+export async function removeTenantStaffMember(
+  tenantId: string,
+  memberUid: string
+): Promise<{ success: boolean; error?: string }> {
+  const cleanTenant = (tenantId || '').trim().toLowerCase();
+  const cleanUid = (memberUid || '').trim();
+
+  if (!cleanTenant || !cleanUid) {
+    return { success: false, error: 'Tenant ID and Member UID are required.' };
+  }
+
+  try {
+    const memberRef = doc(db, 'tenants', cleanTenant, 'members', cleanUid);
+    await deleteDoc(memberRef);
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Failed to remove staff member.' };
+  }
+}
+
+// ==============================================================================
+// PHASE 3B: AUTHORITATIVE DYNAMIC TENANT SLUG RESOLUTION & MANAGEMENT
+// ==============================================================================
+
+export const RESERVED_SLUGS: readonly string[] = [
+  'crm',
+  'portal',
+  'admin',
+  'api',
+  'assets',
+  'downloads',
+  'site',
+  'landing',
+];
+
+/**
+ * Validate and normalize a URL slug for public tenant routing.
+ * Enforces lowercase alphanumeric with single hyphens, length 3-63 chars, and reserved path blocking.
+ */
+export function validateAndNormalizeSlug(rawSlug: string): {
+  isValid: boolean;
+  normalizedSlug: string;
+  error?: string;
+} {
+  if (!rawSlug || typeof rawSlug !== 'string') {
+    return { isValid: false, normalizedSlug: '', error: 'Slug is required.' };
+  }
+
+  const normalized = rawSlug
+    .trim()
+    .toLowerCase()
+    .replace(/^\/+|\/+$/g, '');
+
+  if (!normalized) {
+    return { isValid: false, normalizedSlug: '', error: 'Slug cannot be empty.' };
+  }
+
+  if (normalized.length < 3) {
+    return { isValid: false, normalizedSlug: '', error: 'Slug must be at least 3 characters long.' };
+  }
+
+  if (normalized.length > 63) {
+    return { isValid: false, normalizedSlug: '', error: 'Slug must not exceed 63 characters.' };
+  }
+
+  const slugRegex = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+  if (!slugRegex.test(normalized)) {
+    return {
+      isValid: false,
+      normalizedSlug: '',
+      error: 'Slug must contain only lowercase alphanumeric characters separated by single hyphens.',
+    };
+  }
+
+  if (RESERVED_SLUGS.includes(normalized)) {
+    return {
+      isValid: false,
+      normalizedSlug: '',
+      error: `The slug "${normalized}" is a reserved system path and cannot be assigned to a tenant.`,
+    };
+  }
+
+  return { isValid: true, normalizedSlug: normalized };
+}
+
+/**
+ * Resolve a public URL slug to its underlying Firestore tenant ID.
+ * Reads directly from /slugs/{normalizedSlug}.
+ * If the tenant is suspended or unpublished, Firestore rules reject the getDoc call with permission-denied.
+ */
+export async function resolveSlugToTenant(
+  slug: string
+): Promise<{ success: boolean; tenantId: string | null; error?: string }> {
+  const validation = validateAndNormalizeSlug(slug);
+  if (!validation.isValid) {
+    return { success: false, tenantId: null, error: validation.error };
+  }
+
+  try {
+    const slugRef = doc(db, 'slugs', validation.normalizedSlug);
+    const snap = await getDoc(slugRef);
+    if (!snap.exists()) {
+      return { success: false, tenantId: null, error: 'Slug not found.' };
+    }
+
+    const data = snap.data();
+    const targetTenantId = data?.tenantId;
+    if (!targetTenantId || typeof targetTenantId !== 'string') {
+      return { success: false, tenantId: null, error: 'Corrupt slug mapping: missing tenant ID.' };
+    }
+
+    return { success: true, tenantId: targetTenantId };
+  } catch (err: any) {
+    return {
+      success: false,
+      tenantId: null,
+      error: err?.message || 'Failed to resolve slug mapping.',
+    };
+  }
+}
+
+/**
+ * Safely create or replace a unique slug mapping at /slugs/{slug} in an atomic transaction.
+ * Delegates to updateTenantSlugAtomic so any previous /slugs/{oldSlug} mapping for the tenant
+ * is retired atomically and no obsolete public URLs remain.
+ */
+export async function createSlugMappingAtomic(
+  slug: string,
+  tenantId: string
+): Promise<{ success: boolean; slugMapping?: SlugMapping; error?: string }> {
+  return updateTenantSlugAtomic(tenantId, slug);
+}
+
+/**
+ * Atomically assign or change a tenant's public URL slug inside a Firestore transaction.
+ * - Reads /tenants/{tenantId} and /slugs/{newSlug} (plus any previous /slugs/{oldSlug}) before writes.
+ * - Rejects if tenant does not exist or newSlug is owned by a different tenant.
+ * - Cleans up the previous /slugs/{oldSlug} mapping when changing slugs so stale URLs fail closed.
+ * - Updates /tenants/{tenantId}.slug atomically.
+ */
+export async function updateTenantSlugAtomic(
+  tenantId: string,
+  newSlug: string
+): Promise<{ success: boolean; slugMapping?: SlugMapping; error?: string }> {
+  const cleanTenantId = (tenantId || '').trim().toLowerCase();
+  if (!cleanTenantId) {
+    return { success: false, error: 'Tenant ID is required.' };
+  }
+
+  const validation = validateAndNormalizeSlug(newSlug);
+  if (!validation.isValid) {
+    return { success: false, error: validation.error };
+  }
+
+  const normalizedNewSlug = validation.normalizedSlug;
+  const timestamp = new Date().toISOString();
+  const tenantRef = doc(db, 'tenants', cleanTenantId);
+  const newSlugRef = doc(db, 'slugs', normalizedNewSlug);
+
+  try {
+    const result = await runTransaction(db, async (transaction) => {
+      // 1. Primary reads
+      const [tenantSnap, newSlugSnap] = await Promise.all([
+        transaction.get(tenantRef),
+        transaction.get(newSlugRef),
+      ]);
+
+      if (!tenantSnap.exists()) {
+        throw new Error(`Tenant "${cleanTenantId}" does not exist.`);
+      }
+
+      if (newSlugSnap.exists() && newSlugSnap.data()?.tenantId !== cleanTenantId) {
+        throw new Error(
+          `Slug "${normalizedNewSlug}" is already assigned to another tenant ("${newSlugSnap.data()?.tenantId}").`
+        );
+      }
+
+      const previousSlug =
+        typeof tenantSnap.data()?.slug === 'string'
+          ? tenantSnap.data().slug.trim().toLowerCase()
+          : '';
+      const hasOldSlugToRemove = Boolean(previousSlug && previousSlug !== normalizedNewSlug);
+      const oldSlugRef = hasOldSlugToRemove ? doc(db, 'slugs', previousSlug) : null;
+      const oldSlugSnap = oldSlugRef ? await transaction.get(oldSlugRef) : null;
+
+      // 2. Atomic writes
+      let slugRecord: SlugMapping;
+      if (newSlugSnap.exists()) {
+        const existingData = newSlugSnap.data();
+        slugRecord = {
+          slug: normalizedNewSlug,
+          tenantId: cleanTenantId,
+          createdAt: existingData?.createdAt || timestamp,
+          updatedAt: timestamp,
+        };
+        transaction.update(newSlugRef, { updatedAt: timestamp });
+      } else {
+        slugRecord = {
+          slug: normalizedNewSlug,
+          tenantId: cleanTenantId,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        transaction.set(newSlugRef, slugRecord);
+      }
+
+      if (oldSlugRef && oldSlugSnap && oldSlugSnap.exists() && oldSlugSnap.data()?.tenantId === cleanTenantId) {
+        transaction.delete(oldSlugRef);
+      }
+
+      transaction.update(tenantRef, {
+        slug: normalizedNewSlug,
+        updatedAt: timestamp,
+      });
+
+      return slugRecord;
+    });
+
+    return { success: true, slugMapping: result };
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err?.message || 'Failed to update tenant public URL slug.',
+    };
+  }
+}
+
+/**
+ * Safely hydrate a published Firestore ClientConfig for standalone landing rendering
+ * without ever falling back to hardcoded static client presets for tenant identity.
+ * Always locks clientId strictly to the resolved Firestore tenantId.
+ */
+export function hydratePublicClientConfig(
+  tenantId: string,
+  rawConfig: Partial<ClientConfig>,
+  fallbackBusinessName?: string
+): ClientConfig {
+  const cleanTenantId = (tenantId || '').trim().toLowerCase();
+  const resolvedBusinessName = (
+    rawConfig.businessName ||
+    fallbackBusinessName ||
+    cleanTenantId
+  ).trim();
+
+  return {
+    ...rawConfig,
+    clientId: cleanTenantId,
+    businessName: resolvedBusinessName,
+    industry: rawConfig.industry || 'Local Services',
+    tagline: rawConfig.tagline || '',
+    heroTitle: rawConfig.heroTitle || resolvedBusinessName,
+    heroSubheadline: rawConfig.heroSubheadline || '',
+    yearsInBusiness: typeof rawConfig.yearsInBusiness === 'number' ? rawConfig.yearsInBusiness : 0,
+    jobsCompleted: rawConfig.jobsCompleted || '',
+    averageRating:
+      typeof rawConfig.averageRating === 'number'
+        ? rawConfig.averageRating
+        : Number(rawConfig.averageRating) || 0,
+    reviewCount:
+      typeof rawConfig.reviewCount === 'number'
+        ? rawConfig.reviewCount
+        : Number(rawConfig.reviewCount) || 0,
+    phone: rawConfig.phone || rawConfig.businessPhone || '',
+    phoneRaw: rawConfig.phoneRaw || rawConfig.phone || rawConfig.businessPhone || '',
+    email: rawConfig.email || '',
+    address: rawConfig.address || '',
+    cityStateZip: rawConfig.cityStateZip || rawConfig.serviceArea || '',
+    businessHours: rawConfig.businessHours || '',
+    emergencyAvailability: rawConfig.emergencyAvailability || '',
+    primaryColor: rawConfig.primaryColor || '#0F172A',
+    accentColor: rawConfig.accentColor || '#2563EB',
+    fontFamily: rawConfig.fontFamily || 'Inter, sans-serif',
+    heroImageUrl: rawConfig.heroImageUrl || '',
+    aboutImageUrl: rawConfig.aboutImageUrl || '',
+    googleMapsLink: rawConfig.googleMapsLink || '',
+    googleMapsEmbedUrl: rawConfig.googleMapsEmbedUrl || '',
+    googleReviewLink: rawConfig.googleReviewLink || '',
+    googleAnalyticsId: rawConfig.googleAnalyticsId || '',
+    facebookPixelId: rawConfig.facebookPixelId || '',
+    googleTagManagerId: rawConfig.googleTagManagerId || '',
+    socialLinks: rawConfig.socialLinks || {},
+    seo: rawConfig.seo || {
+      title: resolvedBusinessName,
+      metaDescription: rawConfig.heroSubheadline || '',
+      keywords: [],
+      ogImageUrl: '',
+      canonicalUrl: '',
+    },
+    serviceAreas: Array.isArray(rawConfig.serviceAreas) ? rawConfig.serviceAreas : [],
+    services: Array.isArray(rawConfig.services) ? rawConfig.services : [],
+    testimonials: Array.isArray(rawConfig.testimonials) ? rawConfig.testimonials : [],
+    beforeAfter: Array.isArray(rawConfig.beforeAfter) ? rawConfig.beforeAfter : [],
+    faqs: Array.isArray(rawConfig.faqs) ? rawConfig.faqs : [],
+    trustBadges: Array.isArray(rawConfig.trustBadges) ? rawConfig.trustBadges : [],
+    stats: Array.isArray(rawConfig.stats) ? rawConfig.stats : [],
+    sampleDataNoticeEnabled: false,
+    heroTrustBadgesEnabled: false,
+  };
+}
+
+export interface PublicTenantWebsiteResolution {
+  success: boolean;
+  tenantId: string | null;
+  config: ClientConfig | null;
+  error?: string;
+}
+
+/**
+ * Authoritative Phase 3B Dynamic Tenant Public Website Resolver:
+ * 1. Resolves URL slug via /slugs/{slug} (resolveSlugToTenant)
+ * 2. Loads published website from /tenants/{tenantId}/public/website (fetchPublicWebsiteConfig)
+ * 3. Fails closed for unknown, invalid, reserved, suspended, or unpublished tenants
+ * 4. Guarantees returned config.clientId equals resolved Firestore tenantId
+ */
+export async function resolvePublicTenantWebsiteBySlug(
+  slug: string,
+  deps?: {
+    resolveSlug?: typeof resolveSlugToTenant;
+    fetchWebsite?: typeof fetchPublicWebsiteConfig;
+  }
+): Promise<PublicTenantWebsiteResolution> {
+  const resolveSlugFn = deps?.resolveSlug || resolveSlugToTenant;
+  const fetchWebsiteFn = deps?.fetchWebsite || fetchPublicWebsiteConfig;
+
+  const slugRes = await resolveSlugFn(slug);
+  if (!slugRes.success || !slugRes.tenantId) {
+    return {
+      success: false,
+      tenantId: null,
+      config: null,
+      error: slugRes.error || 'Tenant slug not found or inactive.',
+    };
+  }
+
+  const resolvedTenantId = slugRes.tenantId.trim().toLowerCase();
+  if (!resolvedTenantId) {
+    return {
+      success: false,
+      tenantId: null,
+      config: null,
+      error: 'Invalid resolved tenant ID.',
+    };
+  }
+
+  const siteRes = await fetchWebsiteFn(resolvedTenantId);
+  if (!siteRes.success || !siteRes.isPublished || !siteRes.config) {
+    return {
+      success: false,
+      tenantId: null,
+      config: null,
+      error: siteRes.error || 'Published website not found or tenant unavailable.',
+    };
+  }
+
+  const hydratedConfig = hydratePublicClientConfig(
+    resolvedTenantId,
+    siteRes.config,
+    siteRes.businessName
+  );
+
+  return {
+    success: true,
+    tenantId: resolvedTenantId,
+    config: hydratedConfig,
+  };
+}
+
