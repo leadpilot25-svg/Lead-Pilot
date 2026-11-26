@@ -26,6 +26,7 @@ import {
   Timestamp,
   serverTimestamp,
   deleteDoc,
+  updateDoc,
 } from 'firebase/firestore';
 import { auth, db, handleFirestoreError, OperationType } from '../firebase';
 import { CURRENT_APP_TARGET, IS_DEV_DEPLOYMENT } from '../config/appTarget';
@@ -594,19 +595,25 @@ export async function createTenantRecord(
 }
 
 /**
- * Update tenant status (active | suspended) in Firestore (Administrator only)
+ * Update tenant status (active | suspended) in Firestore (Root Administrator only).
+ * Uses updateDoc so only existing tenant documents can be updated and only status + updatedAt are changed.
  */
 export async function updateTenantStatus(
   tenantId: string,
   status: TenantStatus
 ): Promise<{ success: boolean; error?: string }> {
   const cleanId = (tenantId || '').trim().toLowerCase();
-  if (!cleanId) return { success: false, error: 'Tenant ID is required.' };
+  if (!cleanId || !/^[a-z0-9_-]+$/.test(cleanId)) {
+    return { success: false, error: 'A valid Tenant ID is required.' };
+  }
+  if (status !== 'active' && status !== 'suspended') {
+    return { success: false, error: 'Invalid tenant status. Must be "active" or "suspended".' };
+  }
 
   const timestamp = new Date().toISOString();
   try {
     const tenantRef = doc(db, 'tenants', cleanId);
-    await setDoc(tenantRef, { status, updatedAt: timestamp }, { merge: true });
+    await updateDoc(tenantRef, { status, updatedAt: timestamp });
     return { success: true };
   } catch (err: any) {
     return { success: false, error: err?.message || 'Failed to update tenant status.' };

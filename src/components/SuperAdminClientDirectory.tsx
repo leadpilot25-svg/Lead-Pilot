@@ -14,16 +14,19 @@ import {
   CheckCircle2,
   Settings,
   Link2,
+  Power,
+  AlertTriangle,
 } from 'lucide-react';
 import {
   listTenantRecords,
   createTenantRecord,
   updateTenantSlugAtomic,
+  updateTenantStatus,
   validateAndNormalizeSlug,
   verifyRootAdminStatus,
 } from '../auth/clientAuth';
 import { auth } from '../firebase';
-import { TenantRecord } from '../types';
+import { TenantRecord, TenantStatus } from '../types';
 import { INDUSTRY_PRESETS } from '../presets/industryPresets';
 import { SuperAdminWebsiteEditor } from './SuperAdminWebsiteEditor';
 
@@ -78,6 +81,11 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
   const [slugInputValue, setSlugInputValue] = useState<string>('');
   const [slugModalError, setSlugModalError] = useState<string | null>(null);
   const [isSavingSlug, setIsSavingSlug] = useState<boolean>(false);
+
+  // Account Status Toggle State (Root Admin only)
+  const [updatingStatusTenantId, setUpdatingStatusTenantId] = useState<string | null>(null);
+  const [suspendConfirmTenant, setSuspendConfirmTenant] = useState<TenantRecord | null>(null);
+  const [actionErrorBanner, setActionErrorBanner] = useState<string | null>(null);
 
   // Available industry preset keys with human-readable labels
   const availableIndustries = Object.keys(INDUSTRY_PRESETS).map((key) => ({
@@ -188,6 +196,46 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
       setSlugModalError(err?.message || 'Unexpected error while saving public URL slug.');
     } finally {
       setIsSavingSlug(false);
+    }
+  };
+
+  const handleToggleTenantStatus = async (tenant: TenantRecord, nextStatus: TenantStatus) => {
+    if (updatingStatusTenantId) return;
+    setActionErrorBanner(null);
+    setSuccessBanner(null);
+    setUpdatingStatusTenantId(tenant.tenantId);
+
+    try {
+      const rootOk = verifiedRootAdmin && (await verifyRootAdminStatus(auth.currentUser));
+      if (!rootOk) {
+        setActionErrorBanner(
+          'Action rejected: Only the verified Root Administrator may update client account status.'
+        );
+        return;
+      }
+
+      const res = await updateTenantStatus(tenant.tenantId, nextStatus);
+      if (!res.success) {
+        setActionErrorBanner(
+          res.error || `Failed to update status for "${tenant.businessName}" (${tenant.tenantId}).`
+        );
+        return;
+      }
+
+      setSuspendConfirmTenant(null);
+      setSuccessBanner(
+        `"${tenant.businessName}" (${tenant.tenantId}) status updated to ${
+          nextStatus === 'active' ? 'Active' : 'Suspended'
+        }.`
+      );
+      setTimeout(() => setSuccessBanner(null), 6000);
+      await fetchTenants();
+    } catch (err: any) {
+      setActionErrorBanner(
+        err?.message || `Unexpected error while updating status for "${tenant.businessName}".`
+      );
+    } finally {
+      setUpdatingStatusTenantId(null);
     }
   };
 
@@ -337,8 +385,26 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
             <span className="font-bold text-emerald-200">{successBanner}</span>
           </div>
           <button
+            type="button"
             onClick={() => setSuccessBanner(null)}
-            className="text-emerald-400 hover:text-white text-xs font-bold"
+            className="text-emerald-400 hover:text-white text-xs font-bold cursor-pointer"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Action Error Notification Banner */}
+      {actionErrorBanner && (
+        <div className="mb-6 p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between gap-3 shadow-lg animate-in fade-in">
+          <div className="flex items-center gap-2.5">
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span className="font-bold text-rose-200">{actionErrorBanner}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActionErrorBanner(null)}
+            className="text-rose-400 hover:text-white text-xs font-bold cursor-pointer"
           >
             ✕
           </button>
@@ -607,6 +673,44 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                         {/* Action Buttons */}
                         <td className="px-5 py-4 text-right">
                           <div className="flex items-center justify-end gap-2">
+                            {/* Activate / Suspend Account Status Button (Root Admin only) */}
+                            {verifiedRootAdmin && (
+                              <button
+                                type="button"
+                                disabled={updatingStatusTenantId === tenant.tenantId}
+                                onClick={() =>
+                                  isActive
+                                    ? setSuspendConfirmTenant(tenant)
+                                    : handleToggleTenantStatus(tenant, 'active')
+                                }
+                                className={`px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer border flex items-center gap-1.5 shadow-sm disabled:opacity-50 disabled:cursor-not-allowed ${
+                                  isActive
+                                    ? 'bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border-rose-500/30'
+                                    : 'bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border-emerald-500/40'
+                                }`}
+                                title={
+                                  isActive
+                                    ? 'Suspend this client account'
+                                    : 'Activate this client account'
+                                }
+                              >
+                                {updatingStatusTenantId === tenant.tenantId ? (
+                                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                ) : (
+                                  <Power className="w-3.5 h-3.5" />
+                                )}
+                                <span>
+                                  {updatingStatusTenantId === tenant.tenantId
+                                    ? isActive
+                                      ? 'Suspending...'
+                                      : 'Activating...'
+                                    : isActive
+                                      ? 'Suspend'
+                                      : 'Activate'}
+                                </span>
+                              </button>
+                            )}
+
                             {/* Manage Website Button */}
                             <button
                               onClick={() => setEditingWebsiteTenant(tenant)}
@@ -710,6 +814,39 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                   </div>
 
                   <div className="pt-2 flex flex-col gap-2">
+                    {/* Activate / Suspend Account Status Button (Root Admin only) */}
+                    {verifiedRootAdmin && (
+                      <button
+                        type="button"
+                        disabled={updatingStatusTenantId === tenant.tenantId}
+                        onClick={() =>
+                          isActive
+                            ? setSuspendConfirmTenant(tenant)
+                            : handleToggleTenantStatus(tenant, 'active')
+                        }
+                        className={`w-full py-2 rounded-xl text-xs font-bold transition cursor-pointer border flex items-center justify-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed ${
+                          isActive
+                            ? 'bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border-rose-500/30'
+                            : 'bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border-emerald-500/40'
+                        }`}
+                      >
+                        {updatingStatusTenantId === tenant.tenantId ? (
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Power className="w-3.5 h-3.5" />
+                        )}
+                        <span>
+                          {updatingStatusTenantId === tenant.tenantId
+                            ? isActive
+                              ? 'Suspending Client...'
+                              : 'Activating Client...'
+                            : isActive
+                              ? 'Suspend Client'
+                              : 'Activate Client'}
+                        </span>
+                      </button>
+                    )}
+
                     {/* Public URL Slug Button */}
                     <button
                       type="button"
@@ -1018,6 +1155,75 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Confirm Suspend Client Modal */}
+      {verifiedRootAdmin && suspendConfirmTenant && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in">
+          <div className="relative w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 text-slate-100">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-800 mb-4">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400">
+                  <AlertTriangle className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-extrabold text-white">Suspend Client Account</h3>
+                  <p className="text-xs text-slate-400">{suspendConfirmTenant.businessName}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() =>
+                  updatingStatusTenantId !== suspendConfirmTenant.tenantId &&
+                  setSuspendConfirmTenant(null)
+                }
+                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs text-slate-300">
+              <p>
+                Are you sure you want to suspend{' '}
+                <span className="font-bold text-white">{suspendConfirmTenant.businessName}</span>{' '}
+                (<span className="font-mono text-emerald-400">{suspendConfirmTenant.tenantId}</span>)?
+              </p>
+              <p className="text-slate-400 bg-slate-950/70 border border-slate-800 rounded-xl p-3 leading-relaxed">
+                This updates only the account <span className="font-mono text-slate-200">status</span>{' '}
+                to <span className="font-semibold text-amber-300">suspended</span>, disabling
+                public portal access and client CRM access. Existing leads, website content, public
+                URL slug, and Google Sheets settings are preserved.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-3 pt-4 mt-5 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setSuspendConfirmTenant(null)}
+                disabled={updatingStatusTenantId === suspendConfirmTenant.tenantId}
+                className="px-4 py-2 rounded-xl text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 font-bold text-xs transition cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={updatingStatusTenantId === suspendConfirmTenant.tenantId}
+                onClick={() => handleToggleTenantStatus(suspendConfirmTenant, 'suspended')}
+                className="flex items-center gap-2 px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white font-bold text-xs transition shadow-md cursor-pointer"
+              >
+                {updatingStatusTenantId === suspendConfirmTenant.tenantId && (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                )}
+                <span>
+                  {updatingStatusTenantId === suspendConfirmTenant.tenantId
+                    ? 'Suspending...'
+                    : 'Confirm Suspend'}
+                </span>
+              </button>
+            </div>
           </div>
         </div>
       )}

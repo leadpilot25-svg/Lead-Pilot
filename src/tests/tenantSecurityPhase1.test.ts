@@ -499,4 +499,50 @@ describe('Phase 1: Multi-Tenant Data Layer & Security Rules Suite (Static & Simu
       expect(evaluatePublishRule(false, true, true)).toBe(false);
     });
   });
+
+  // =========================================================================
+  // SECTION F: CLIENT DIRECTORY ACTIVATE / SUSPEND CONTROLS
+  // =========================================================================
+  describe('Section F: Client Directory Activate / Suspend Controls', () => {
+    it('1. updateTenantStatus rejects empty or malformed tenant IDs and invalid status values', async () => {
+      const { updateTenantStatus } = await import('../auth/clientAuth');
+
+      const emptyRes = await updateTenantStatus('', 'active');
+      expect(emptyRes.success).toBe(false);
+
+      const invalidIdRes = await updateTenantStatus('bad/tenant/id', 'active');
+      expect(invalidIdRes.success).toBe(false);
+
+      const invalidStatusRes = await updateTenantStatus(
+        'prodrain-plumbing-kochi',
+        'pending' as unknown as TenantStatus
+      );
+      expect(invalidStatusRes.success).toBe(false);
+    });
+
+    it('2. updateTenantStatus uses updateDoc on tenants/{tenantId} to update only status and updatedAt', () => {
+      const clientAuthSource = fs.readFileSync(
+        path.resolve(process.cwd(), 'src/auth/clientAuth.ts'),
+        'utf8'
+      );
+      const fnBlock =
+        clientAuthSource.match(/export async function updateTenantStatus[\s\S]*?\n\}/)?.[0] || '';
+      expect(fnBlock).not.toBe('');
+      expect(fnBlock).toContain("doc(db, 'tenants', cleanId)");
+      expect(fnBlock).toContain('updateDoc(tenantRef, { status, updatedAt: timestamp })');
+      expect(fnBlock).not.toContain('setDoc(');
+    });
+
+    it('3. SuperAdminClientDirectory gates Activate/Suspend behind verifiedRootAdmin and confirms before suspending', () => {
+      const dirSource = fs.readFileSync(
+        path.resolve(process.cwd(), 'src/components/SuperAdminClientDirectory.tsx'),
+        'utf8'
+      );
+      expect(dirSource).toContain('updateTenantStatus(tenant.tenantId, nextStatus)');
+      expect(dirSource).toContain('verifiedRootAdmin');
+      expect(dirSource).toContain('setSuspendConfirmTenant(tenant)');
+      expect(dirSource).toContain('Confirm Suspend');
+      expect(dirSource).toContain('await fetchTenants()');
+    });
+  });
 });
