@@ -1206,6 +1206,156 @@ export async function listTenantMembers(tenantId: string): Promise<TenantMemberR
   }
 }
 
+export interface TenantOwnerLoginInfo {
+  created: boolean;
+  uid?: string;
+  email?: string;
+  role: 'business_owner';
+  addedAt?: string;
+}
+
+export interface CreateClientLoginInput {
+  tenantId: string;
+  clientName: string;
+  clientEmail: string;
+  role?: 'business_owner';
+}
+
+export interface CreateClientLoginResult {
+  success: boolean;
+  uid?: string;
+  tenantId?: string;
+  clientName?: string;
+  clientEmail?: string;
+  role?: 'business_owner';
+  setupLink?: string;
+  emailSent?: boolean;
+  code?: string;
+  error?: string;
+}
+
+/**
+ * Inspect existing /tenants/{tenantId}/members to determine whether a Business Owner CRM login
+ * has already been created for the tenant.
+ */
+export async function getTenantOwnerLoginInfo(tenantId: string): Promise<TenantOwnerLoginInfo> {
+  const members = await listTenantMembers(tenantId);
+  const owner = members.find((m) => m.role === 'owner');
+  if (!owner) {
+    return { created: false, role: 'business_owner' };
+  }
+  return {
+    created: true,
+    uid: owner.uid,
+    email: owner.email,
+    role: 'business_owner',
+    addedAt: owner.addedAt,
+  };
+}
+
+/**
+ * Create a tenant-scoped Business Owner CRM login strictly through the trusted server endpoint
+ * (/api/create-client-login). Never creates Firebase Auth users inside the browser session.
+ */
+export async function createClientOwnerLogin(
+  input: CreateClientLoginInput
+): Promise<CreateClientLoginResult> {
+  const cleanTenant = (input.tenantId || '').trim().toLowerCase();
+  const cleanName = (input.clientName || '').trim();
+  const cleanEmail = (input.clientEmail || '').trim().toLowerCase();
+  const role = input.role ?? 'business_owner';
+
+  if (!cleanTenant || !/^[a-z0-9_-]{1,128}$/.test(cleanTenant)) {
+    return { success: false, error: 'A valid Tenant ID is required.' };
+  }
+  if (cleanName.length < 2 || cleanName.length > 100) {
+    return { success: false, error: 'Client name must be between 2 and 100 characters.' };
+  }
+  if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    return { success: false, error: 'A valid client email address is required.' };
+  }
+  if (cleanEmail === ROOT_ADMIN_EMAIL) {
+    return { success: false, error: 'Root Administrator email cannot be assigned as a client login.' };
+  }
+  if (role !== 'business_owner') {
+    return { success: false, error: 'Invalid role. Client CRM logins are fixed to business_owner.' };
+  }
+
+  const currentUser = auth.currentUser;
+  if (!currentUser || !(await verifyRootAdminStatus(currentUser))) {
+    return {
+      success: false,
+      error: 'Action rejected: Only the verified Root Administrator may create client CRM logins.',
+    };
+  }
+
+  // Client-side pre-flight guard: verify tenant exists and is active without ever auto-activating
+  const tenantRec = await getTenantRecord(cleanTenant);
+  if (!tenantRec) {
+    return { success: false, error: `Tenant "${cleanTenant}" was not found.` };
+  }
+  if (tenantRec.status !== 'active') {
+    return {
+      success: false,
+      error: `Cannot create login: Tenant "${cleanTenant}" is suspended. Activate the client first.`,
+    };
+  }
+
+  try {
+    const idToken = await currentUser.getIdToken();
+    const res = await fetch('/api/create-client-login', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`,
+      },
+      body: JSON.stringify({
+        tenantId: cleanTenant,
+        clientName: cleanName,
+        clientEmail: cleanEmail,
+        role: 'business_owner',
+      }),
+    });
+
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      return {
+        success: false,
+        code: 'BACKEND_UNREACHABLE',
+        error:
+          'The secure login provisioning backend (/api/create-client-login) is unavailable in this environment. Deploy to Cloudflare Pages with FIREBASE_SERVICE_ACCOUNT_JSON and ROOT_ADMIN_UID configured.',
+      };
+    }
+
+    const data: any = await res.json().catch(() => null);
+    if (!res.ok || !data?.success) {
+      return {
+        success: false,
+        code: data?.code,
+        error: data?.message || `Failed to create client login (HTTP ${res.status}).`,
+      };
+    }
+
+    return {
+      success: true,
+      uid: data.uid,
+      tenantId: data.tenantId || cleanTenant,
+      clientName: data.clientName || cleanName,
+      clientEmail: data.clientEmail || cleanEmail,
+      role: 'business_owner',
+      setupLink: data.setupLink,
+      emailSent: Boolean(data.emailSent),
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      error:
+        err?.message ||
+        'Network error while contacting /api/create-client-login. Verify Cloudflare Pages deployment.',
+    };
+  }
+}
+
 /**
  * List all pending staff invitations for a tenant (/tenants/{tenantId}/invites)
  */

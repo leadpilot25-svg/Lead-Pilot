@@ -16,12 +16,20 @@ import {
   Link2,
   Power,
   AlertTriangle,
+  KeyRound,
+  Copy,
+  Check,
+  UserPlus,
 } from 'lucide-react';
 import {
   listTenantRecords,
   createTenantRecord,
   updateTenantSlugAtomic,
   updateTenantStatus,
+  getTenantOwnerLoginInfo,
+  createClientOwnerLogin,
+  TenantOwnerLoginInfo,
+  CreateClientLoginResult,
   validateAndNormalizeSlug,
   verifyRootAdminStatus,
 } from '../auth/clientAuth';
@@ -87,6 +95,17 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
   const [suspendConfirmTenant, setSuspendConfirmTenant] = useState<TenantRecord | null>(null);
   const [actionErrorBanner, setActionErrorBanner] = useState<string | null>(null);
 
+  // Client CRM Login Status & Creation Modal State (Root Admin only)
+  const [ownerLoginsByTenant, setOwnerLoginsByTenant] = useState<Record<string, TenantOwnerLoginInfo>>({});
+  const [loginModalTenant, setLoginModalTenant] = useState<TenantRecord | null>(null);
+  const [loginClientName, setLoginClientName] = useState<string>('');
+  const [loginClientEmail, setLoginClientEmail] = useState<string>('');
+  const [loginModalStep, setLoginModalStep] = useState<'form' | 'confirm' | 'result'>('form');
+  const [loginModalError, setLoginModalError] = useState<string | null>(null);
+  const [isCreatingLogin, setIsCreatingLogin] = useState<boolean>(false);
+  const [createdLoginResult, setCreatedLoginResult] = useState<CreateClientLoginResult | null>(null);
+  const [copiedSetupLink, setCopiedSetupLink] = useState<boolean>(false);
+
   // Available industry preset keys with human-readable labels
   const availableIndustries = Object.keys(INDUSTRY_PRESETS).map((key) => ({
     key,
@@ -99,6 +118,10 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
     try {
       const records = await listTenantRecords();
       setTenants(records);
+      const loginEntries = await Promise.all(
+        records.map(async (t) => [t.tenantId, await getTenantOwnerLoginInfo(t.tenantId)] as const)
+      );
+      setOwnerLoginsByTenant(Object.fromEntries(loginEntries));
       return records;
     } catch (err: any) {
       setErrorMessage(
@@ -236,6 +259,105 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
       );
     } finally {
       setUpdatingStatusTenantId(null);
+    }
+  };
+
+  const handleOpenCreateLoginModal = (tenant: TenantRecord) => {
+    setLoginModalTenant(tenant);
+    setLoginClientName(tenant.businessName || '');
+    setLoginClientEmail(tenant.ownerEmail || '');
+    setLoginModalStep('form');
+    setLoginModalError(null);
+    setCreatedLoginResult(null);
+    setCopiedSetupLink(false);
+  };
+
+  const handleCloseCreateLoginModal = () => {
+    if (isCreatingLogin) return;
+    setLoginModalTenant(null);
+    setLoginModalError(null);
+    setCreatedLoginResult(null);
+    setCopiedSetupLink(false);
+  };
+
+  const handleReviewCreateLogin = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!loginModalTenant) return;
+    setLoginModalError(null);
+
+    if (loginModalTenant.status !== 'active') {
+      setLoginModalError(
+        `Cannot create login: Tenant "${loginModalTenant.tenantId}" is suspended. Activate the tenant first.`
+      );
+      return;
+    }
+
+    const cleanName = loginClientName.trim();
+    const cleanEmail = loginClientEmail.trim().toLowerCase();
+
+    if (cleanName.length < 2 || cleanName.length > 100) {
+      setLoginModalError('Client name must be between 2 and 100 characters.');
+      return;
+    }
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      setLoginModalError('Please enter a valid client email address.');
+      return;
+    }
+
+    setLoginModalStep('confirm');
+  };
+
+  const handleConfirmCreateLogin = async () => {
+    if (!loginModalTenant || isCreatingLogin) return;
+    setLoginModalError(null);
+    setIsCreatingLogin(true);
+
+    try {
+      const res = await createClientOwnerLogin({
+        tenantId: loginModalTenant.tenantId,
+        clientName: loginClientName.trim(),
+        clientEmail: loginClientEmail.trim().toLowerCase(),
+        role: 'business_owner',
+      });
+
+      if (!res.success) {
+        setLoginModalError(res.error || 'Failed to create client CRM login.');
+        return;
+      }
+
+      setCreatedLoginResult(res);
+      setLoginModalStep('result');
+      setOwnerLoginsByTenant((prev) => ({
+        ...prev,
+        [loginModalTenant.tenantId]: {
+          created: true,
+          uid: res.uid,
+          email: res.clientEmail,
+          role: 'business_owner',
+          addedAt: new Date().toISOString(),
+        },
+      }));
+      setSuccessBanner(
+        `Client CRM login created for "${loginModalTenant.businessName}" (${res.clientEmail}).`
+      );
+      setTimeout(() => setSuccessBanner(null), 6000);
+      await fetchTenants();
+    } catch (err: any) {
+      setLoginModalError(err?.message || 'Unexpected error while creating client CRM login.');
+    } finally {
+      setIsCreatingLogin(false);
+    }
+  };
+
+  const handleCopySetupLink = async () => {
+    const link = createdLoginResult?.setupLink;
+    if (!link) return;
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopiedSetupLink(true);
+      setTimeout(() => setCopiedSetupLink(false), 3000);
+    } catch {
+      setCopiedSetupLink(false);
     }
   };
 
@@ -552,6 +674,7 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                     <th className="px-5 py-3.5">Tenant ID & Public URL</th>
                     <th className="px-5 py-3.5">Industry</th>
                     <th className="px-5 py-3.5">Owner Email</th>
+                    <th className="px-5 py-3.5">Client CRM Login</th>
                     <th className="px-5 py-3.5">Account Status</th>
                     <th className="px-5 py-3.5">Website Status</th>
                     <th className="px-5 py-3.5 text-right">Actions</th>
@@ -562,6 +685,7 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                     const isActive = tenant.status === 'active';
                     const isPublished = Boolean(tenant.isPublished);
                     const isSelected = activeSelectedTenant === tenant.tenantId;
+                    const ownerLogin = ownerLoginsByTenant[tenant.tenantId];
 
                     return (
                       <tr
@@ -641,6 +765,30 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                           )}
                         </td>
 
+                        {/* Client CRM Login Status */}
+                        <td className="px-5 py-4">
+                          {ownerLogin?.created ? (
+                            <div className="space-y-1">
+                              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
+                                <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                                Created
+                              </span>
+                              {ownerLogin.email && (
+                                <div className="text-[11px] text-slate-200 font-medium break-all">
+                                  {ownerLogin.email}
+                                </div>
+                              )}
+                              <div className="text-[10px] font-mono text-sky-300">
+                                Role: business_owner
+                              </div>
+                            </div>
+                          ) : (
+                            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-slate-800 text-slate-400 border border-slate-700">
+                              Not Created
+                            </span>
+                          )}
+                        </td>
+
                         {/* Account Status */}
                         <td className="px-5 py-4">
                           {isActive ? (
@@ -672,7 +820,25 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
 
                         {/* Action Buttons */}
                         <td className="px-5 py-4 text-right">
-                          <div className="flex items-center justify-end gap-2">
+                          <div className="flex items-center justify-end gap-2 flex-wrap">
+                            {/* Create Client Login Button (Root Admin only) */}
+                            {verifiedRootAdmin && !ownerLogin?.created && (
+                              <button
+                                type="button"
+                                disabled={!isActive}
+                                onClick={() => handleOpenCreateLoginModal(tenant)}
+                                className="px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/40 flex items-center gap-1.5 shadow-sm disabled:opacity-40 disabled:cursor-not-allowed"
+                                title={
+                                  isActive
+                                    ? 'Create Business Owner CRM login for this client'
+                                    : 'Activate this client before creating a CRM login'
+                                }
+                              >
+                                <KeyRound className="w-3.5 h-3.5 text-blue-300" />
+                                <span>Create Client Login</span>
+                              </button>
+                            )}
+
                             {/* Activate / Suspend Account Status Button (Root Admin only) */}
                             {verifiedRootAdmin && (
                               <button
@@ -750,6 +916,7 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
               const isActive = tenant.status === 'active';
               const isPublished = Boolean(tenant.isPublished);
               const isSelected = activeSelectedTenant === tenant.tenantId;
+              const ownerLogin = ownerLoginsByTenant[tenant.tenantId];
 
               return (
                 <div
@@ -813,7 +980,48 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                     </div>
                   </div>
 
+                  {/* Mobile Client CRM Login Status */}
+                  <div className="bg-slate-950/60 border border-slate-800/80 rounded-xl p-3 text-xs space-y-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] uppercase font-bold text-slate-500">
+                        Client CRM Login
+                      </span>
+                      {ownerLogin?.created ? (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
+                          Created
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-800 text-slate-400 border border-slate-700">
+                          Not Created
+                        </span>
+                      )}
+                    </div>
+                    {ownerLogin?.created && (
+                      <div className="pt-1 space-y-0.5">
+                        {ownerLogin.email && (
+                          <div className="text-slate-200 font-medium break-all">{ownerLogin.email}</div>
+                        )}
+                        <div className="text-[11px] font-mono text-sky-300">Role: business_owner</div>
+                      </div>
+                    )}
+                  </div>
+
                   <div className="pt-2 flex flex-col gap-2">
+                    {/* Create Client Login Button (Root Admin only) */}
+                    {verifiedRootAdmin && !ownerLogin?.created && (
+                      <button
+                        type="button"
+                        disabled={!isActive}
+                        onClick={() => handleOpenCreateLoginModal(tenant)}
+                        className="w-full py-2 rounded-xl text-xs font-bold transition cursor-pointer flex items-center justify-center gap-1.5 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/40 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <KeyRound className="w-3.5 h-3.5 text-blue-300" />
+                        <span>
+                          {isActive ? 'Create Client Login' : 'Create Client Login (Activate First)'}
+                        </span>
+                      </button>
+                    )}
+
                     {/* Activate / Suspend Account Status Button (Root Admin only) */}
                     {verifiedRootAdmin && (
                       <button
@@ -1224,6 +1432,247 @@ export const SuperAdminClientDirectory: React.FC<SuperAdminClientDirectoryProps>
                 </span>
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Create Client Login Modal (Root Admin only) */}
+      {verifiedRootAdmin && loginModalTenant && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in">
+          <div className="relative w-full max-w-lg max-h-[90vh] overflow-y-auto bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 text-slate-100">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-800 mb-4">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-blue-500/10 border border-blue-500/30 text-blue-400">
+                  <UserPlus className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-extrabold text-white">Create Client CRM Login</h3>
+                  <p className="text-xs text-slate-400">{loginModalTenant.businessName}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleCloseCreateLoginModal}
+                disabled={isCreatingLogin}
+                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {loginModalError && (
+              <div className="mb-4 p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <span>{loginModalError}</span>
+              </div>
+            )}
+
+            {loginModalStep === 'form' && (
+              <form onSubmit={handleReviewCreateLogin} className="space-y-4 text-xs">
+                <div>
+                  <label className="block text-slate-300 font-bold mb-1">
+                    Client Name <span className="text-rose-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={loginClientName}
+                    onChange={(e) => setLoginClientName(e.target.value)}
+                    placeholder="e.g. Rajesh Nair"
+                    className="w-full bg-slate-950 border border-slate-700 focus:border-blue-500 rounded-xl px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none transition"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-slate-300 font-bold mb-1">
+                    Client Email <span className="text-rose-400">*</span>
+                  </label>
+                  <input
+                    type="email"
+                    required
+                    value={loginClientEmail}
+                    onChange={(e) => setLoginClientEmail(e.target.value)}
+                    placeholder="e.g. owner@business.com"
+                    className="w-full bg-slate-950 border border-slate-700 focus:border-blue-500 rounded-xl px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none transition"
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-slate-300 font-bold mb-1">
+                      Tenant ID (Read-only)
+                    </label>
+                    <input
+                      type="text"
+                      readOnly
+                      value={loginModalTenant.tenantId}
+                      className="w-full bg-slate-950/60 border border-slate-800 rounded-xl px-3.5 py-2.5 text-emerald-400 font-mono cursor-not-allowed focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-300 font-bold mb-1">
+                      Role (Fixed)
+                    </label>
+                    <input
+                      type="text"
+                      readOnly
+                      value="business_owner"
+                      className="w-full bg-slate-950/60 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sky-300 font-mono cursor-not-allowed focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-3 text-[11px] text-slate-400 leading-relaxed">
+                  No password is entered or stored. The server creates the Firebase Authentication
+                  account scoped exclusively to{' '}
+                  <span className="font-mono text-emerald-400">{loginModalTenant.tenantId}</span> and
+                  generates a one-time password setup link for the client.
+                </div>
+
+                <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
+                  <button
+                    type="button"
+                    onClick={handleCloseCreateLoginModal}
+                    className="px-4 py-2 rounded-xl text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 font-bold text-xs transition cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="flex items-center gap-2 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs transition shadow-md cursor-pointer"
+                  >
+                    <span>Review & Continue</span>
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {loginModalStep === 'confirm' && (
+              <div className="space-y-4 text-xs">
+                <p className="text-slate-300">
+                  Confirm creating a dedicated Business Owner CRM login with the details below:
+                </p>
+
+                <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-slate-400">Client Name</span>
+                    <span className="font-bold text-white">{loginClientName.trim()}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-slate-400">Client Email</span>
+                    <span className="font-bold text-white break-all">
+                      {loginClientEmail.trim().toLowerCase()}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-slate-400">Tenant ID</span>
+                    <span className="font-mono text-emerald-400">{loginModalTenant.tenantId}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-slate-400">Role</span>
+                    <span className="font-mono text-sky-300">business_owner</span>
+                  </div>
+                </div>
+
+                <p className="text-[11px] text-slate-400 leading-relaxed">
+                  This user will only access CRM leads and team management for{' '}
+                  <span className="font-mono text-emerald-400">{loginModalTenant.tenantId}</span> and
+                  cannot access other tenants or Root Admin tools.
+                </p>
+
+                <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setLoginModalStep('form')}
+                    disabled={isCreatingLogin}
+                    className="px-4 py-2 rounded-xl text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 font-bold text-xs transition cursor-pointer"
+                  >
+                    Back
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isCreatingLogin}
+                    onClick={handleConfirmCreateLogin}
+                    className="flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs transition shadow-md cursor-pointer"
+                  >
+                    {isCreatingLogin && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                    <span>{isCreatingLogin ? 'Creating Login...' : 'Confirm & Create Login'}</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {loginModalStep === 'result' && createdLoginResult && (
+              <div className="space-y-4 text-xs">
+                <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-200 flex items-start gap-2.5">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-bold">Client CRM Login Created</p>
+                    <p className="text-emerald-300/90 mt-0.5">
+                      Email <span className="font-semibold">{createdLoginResult.clientEmail}</span>{' '}
+                      has been provisioned with role{' '}
+                      <span className="font-mono">business_owner</span> for{' '}
+                      <span className="font-mono">{createdLoginResult.tenantId}</span>.
+                    </p>
+                  </div>
+                </div>
+
+                {createdLoginResult.setupLink && (
+                  <div className="space-y-2">
+                    <label className="block text-slate-300 font-bold">
+                      One-Time Password Setup Link
+                    </label>
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="text"
+                        readOnly
+                        value={createdLoginResult.setupLink}
+                        onFocus={(e) => e.currentTarget.select()}
+                        className="flex-1 bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-[11px] font-mono text-sky-300 focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleCopySetupLink}
+                        className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer shrink-0"
+                      >
+                        {copiedSetupLink ? (
+                          <>
+                            <Check className="w-3.5 h-3.5" />
+                            <span>Copied</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>Copy Link</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 text-[11px] text-amber-200 leading-relaxed space-y-1">
+                  <p className="font-bold text-amber-300">How to share this link securely:</p>
+                  <p>
+                    No automatic email was sent because no outbound email service is configured.
+                    Copy this link and send it directly to the business owner via private message
+                    (e.g., WhatsApp or direct email). Once they open the link and set their own
+                    password, they can sign in to the CRM with{' '}
+                    <span className="font-mono">{createdLoginResult.clientEmail}</span>.
+                  </p>
+                </div>
+
+                <div className="flex justify-end pt-3 border-t border-slate-800">
+                  <button
+                    type="button"
+                    onClick={handleCloseCreateLoginModal}
+                    className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs transition cursor-pointer"
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
