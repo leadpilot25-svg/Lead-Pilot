@@ -10,9 +10,14 @@ import {
   ExtendedJsonWebKey,
   PagesContext,
 } from '../../functions/api/sync-sheet';
+import {
+  onRequestPost as onSubmitLeadPost,
+  onRequestOptions as onSubmitLeadOptions,
+  resolvePublicAppsScriptEndpoint,
+} from '../../functions/api/submit-lead';
 import { resolveCurrentTenantId, REGISTERED_HOSTNAME_MAP, getAuthoritativeTenantConfig } from '../config/appTarget';
 import { getClientConfigForEnvClientId, resolveTenantFormEndpoint } from '../config/clientConfigResolver';
-import { fetchRemoteSheetLeads, syncGoogleSheetToCrm } from '../utils/leadStorage';
+import { fetchRemoteSheetLeads, syncGoogleSheetToCrm, saveLead, wasLeadSheetSyncFailed, saveAllLeads } from '../utils/leadStorage';
 
 describe('Cloudflare Pages Functions: Critical Security Gateway Test Suite', () => {
   const PROJECT_ID = 'bamboo-tangent-x8gvj';
@@ -820,6 +825,239 @@ describe('Cloudflare Pages Functions: Critical Security Gateway Test Suite', () 
       expect(res.message).toContain('Authentication required');
     } finally {
       (global as any).window = origWindow;
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // SECTION 9: Public Website Enquiry Gateway (/api/submit-lead) & Non-Silent Failures
+  // --------------------------------------------------------------------------
+  it('40. Public Enquiry Gateway: CORS preflight succeeds and resolvePublicAppsScriptEndpoint resolves per tenant cleanly', async () => {
+    const corsRes = await onSubmitLeadOptions();
+    expect(corsRes.status).toBe(204);
+
+    const url = resolvePublicAppsScriptEndpoint('roofing-client-01', {
+      APPSCRIPT_ENDPOINT_ROOFING_CLIENT_01: 'https://script.google.com/macros/s/AKfy_roofing_v6/exec',
+    });
+    expect(url).toBe('https://script.google.com/macros/s/AKfy_roofing_v6/exec');
+
+    expect(
+      resolvePublicAppsScriptEndpoint('unknown-tenant', {
+        APPSCRIPT_ENDPOINT_ROOFING_CLIENT_01: 'https://script.google.com/macros/s/AKfy_roofing_v6/exec',
+      })
+    ).toBeNull();
+  });
+
+  it('41. Public Enquiry Gateway: rejects non-createLead actions with HTTP 403', async () => {
+    for (const action of ['getLeads', 'updateStatus', 'deleteLead', 'addNote']) {
+      const request = new Request('https://leadpilot-staging.pages.dev/api/submit-lead', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, clientId: 'roofing-client-01', name: 'Test', phone: '+1 555 000 1111' }),
+      });
+
+      const res = await onSubmitLeadPost({
+        request,
+        env: {
+          APPSCRIPT_ENDPOINT_ROOFING_CLIENT_01: 'https://script.google.com/macros/s/AKfy_roofing_v6/exec',
+        },
+      });
+
+      expect(res.status).toBe(403);
+      const json = await res.json();
+      expect(json.success).toBe(false);
+      expect(json.sheetSynced).toBe(false);
+    }
+  });
+
+  it('42. Public Enquiry Gateway: forwards createLead to server Apps Script endpoint and verifies write', async () => {
+    const origFetch = global.fetch;
+    let forwardedUrl = '';
+    let forwardedBody: any = null;
+
+    global.fetch = (async (input: any, init?: any) => {
+      forwardedUrl = String(input);
+      forwardedBody = JSON.parse(String(init?.body || '{}'));
+      return new Response(
+        JSON.stringify({
+          status: 'success',
+          result: 'success',
+          leadId: forwardedBody.id || 'LP-20261125-0010',
+          rowNumber: 2,
+          writeVerified: true,
+          message: 'Lead recorded in Google Sheet successfully.',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }) as any;
+
+    try {
+      const request = new Request('https://leadpilot-staging.pages.dev/api/submit-lead', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'createLead',
+          id: 'LP-20261125-0010',
+          clientId: 'roofing-client-01',
+          businessName: 'Test Client',
+          name: 'Liam Carter',
+          phone: '+1 555 212 8899',
+          service: 'Roof Replacement',
+          details: 'Need inspection',
+        }),
+      });
+
+      const res = await onSubmitLeadPost({
+        request,
+        env: {
+          APPSCRIPT_ENDPOINT_ROOFING_CLIENT_01: 'https://script.google.com/macros/s/AKfy_roofing_v6/exec',
+        },
+      });
+
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.success).toBe(true);
+      expect(json.sheetSynced).toBe(true);
+      expect(json.writeVerified).toBe(true);
+      expect(json.rowNumber).toBe(2);
+      expect(forwardedUrl).toBe('https://script.google.com/macros/s/AKfy_roofing_v6/exec');
+      expect(forwardedBody.clientId).toBe('roofing-client-01');
+      expect(forwardedBody.action).toBe('createLead');
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('43. Public Enquiry Gateway: fails closed (502) when upstream returns writeVerified: false', async () => {
+    const origFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          status: 'error',
+          result: 'error',
+          writeVerified: false,
+          message: 'Google Sheet row could not be verified after write.',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )) as any;
+
+    try {
+      const request = new Request('https://leadpilot-staging.pages.dev/api/submit-lead', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'createLead',
+          clientId: 'roofing-client-01',
+          name: 'Liam Carter',
+          phone: '+1 555 212 8899',
+          service: 'Roof Replacement',
+        }),
+      });
+
+      const res = await onSubmitLeadPost({
+        request,
+        env: {
+          APPSCRIPT_ENDPOINT_ROOFING_CLIENT_01: 'https://script.google.com/macros/s/AKfy_roofing_v6/exec',
+        },
+      });
+
+      expect(res.status).toBe(400);
+      const json = await res.json();
+      expect(json.success).toBe(false);
+      expect(json.sheetSynced).toBe(false);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('44. saveLead on leadpilot-staging.pages.dev routes empty endpointUrl via /api/submit-lead and never masks failed sync retries', async () => {
+    const origWindow = (global as any).window;
+    const origFetch = global.fetch;
+    const origStorage = (global as any).localStorage;
+    const mem = new Map<string, string>();
+
+    try {
+      (global as any).localStorage = {
+        getItem: (k: string) => mem.get(k) ?? null,
+        setItem: (k: string, v: string) => mem.set(k, String(v)),
+        removeItem: (k: string) => mem.delete(k),
+        clear: () => mem.clear(),
+      };
+      (global as any).window = {
+        location: { hostname: 'leadpilot-staging.pages.dev' },
+      };
+
+      saveAllLeads([], 'roofing-client-01');
+
+      let attempt = 0;
+      global.fetch = (async (input: any) => {
+        attempt++;
+        expect(String(input)).toBe('/api/submit-lead');
+        if (attempt === 1) {
+          return new Response(
+            JSON.stringify({
+              success: false,
+              sheetSynced: false,
+              message: 'Google Sheet recording error: writeVerified false',
+            }),
+            { status: 502, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            success: true,
+            status: 'success',
+            result: 'success',
+            sheetSynced: true,
+            writeVerified: true,
+            rowNumber: 2,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }) as any;
+
+      const failedRes = await saveLead(
+        {
+          clientId: 'roofing-client-01',
+          businessName: 'Test Client',
+          name: 'Retry Customer',
+          phone: '+1 555 333 4444',
+          service: 'Roof Replacement',
+        },
+        '',
+        {
+          requireSheetSync: true,
+          persistLeadToFirestore: async () => {},
+        }
+      );
+
+      expect(failedRes.success).toBe(false);
+      expect(failedRes.sheetSynced).toBe(false);
+      expect(wasLeadSheetSyncFailed(failedRes.lead.id)).toBe(true);
+
+      // Immediate retry with same phone/service must NOT be swallowed by 5-minute duplicate guard
+      const retryRes = await saveLead(
+        {
+          clientId: 'roofing-client-01',
+          businessName: 'Test Client',
+          name: 'Retry Customer',
+          phone: '+1 555 333 4444',
+          service: 'Roof Replacement',
+        },
+        '',
+        {
+          requireSheetSync: true,
+          persistLeadToFirestore: async () => {},
+        }
+      );
+
+      expect(attempt).toBe(2);
+      expect(retryRes.success).toBe(true);
+      expect(retryRes.sheetSynced).toBe(true);
+      expect(wasLeadSheetSyncFailed(retryRes.lead.id)).toBe(false);
+    } finally {
+      (global as any).window = origWindow;
+      (global as any).localStorage = origStorage;
+      global.fetch = origFetch;
     }
   });
 });

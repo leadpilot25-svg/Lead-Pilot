@@ -5,13 +5,13 @@ import {
   AuthoritativeTenantResult,
   parseAppRoute,
 } from './config/appTarget';
-import { resolvePublicTenantWebsiteBySlug } from './auth/clientAuth';
+import { resolvePublicTenantWebsiteBySlug, fetchPublicWebsiteConfig, hydratePublicClientConfig } from './auth/clientAuth';
 import { PortalNotFound } from './components/PortalNotFound';
 import { ClientConfig } from './types';
 
 export default function AppLanding() {
   const [currentRoute, setCurrentRoute] = useState(() => parseAppRoute());
-  const [resolvedState] = useState<AuthoritativeTenantResult>(() => getAuthoritativeTenantConfig());
+  const [resolvedState, setResolvedState] = useState<AuthoritativeTenantResult>(() => getAuthoritativeTenantConfig());
   const [dynamicTenantState, setDynamicTenantState] = useState<{
     status: 'idle' | 'loading' | 'resolved' | 'not_found';
     slug: string | null;
@@ -30,6 +30,43 @@ export default function AppLanding() {
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
+
+  // Hydrate hostname-mapped root tenant config (e.g. leadpilot-staging.pages.dev -> roofing-client-01)
+  // from /tenants/{tenantId}/public/website so saved CONFIG.formEndpoint and website updates apply on '/'.
+  useEffect(() => {
+    if (currentRoute.tenantSlug || !resolvedState.isValid || !resolvedState.tenantId || !resolvedState.config) {
+      return;
+    }
+
+    const baseConfig = resolvedState.config;
+    const targetTenantId = resolvedState.tenantId.trim().toLowerCase();
+    let cancelled = false;
+
+    fetchPublicWebsiteConfig(targetTenantId)
+      .then((res) => {
+        if (cancelled) return;
+        if (res.success && res.isPublished && res.config) {
+          const mergedRaw: Partial<ClientConfig> = {
+            ...baseConfig,
+            ...res.config,
+            formEndpoint: (res.config.formEndpoint || baseConfig.formEndpoint || '').trim(),
+          };
+          const hydrated = hydratePublicClientConfig(
+            targetTenantId,
+            mergedRaw,
+            res.businessName || baseConfig.businessName
+          );
+          setResolvedState((prev) => ({ ...prev, config: hydrated }));
+        }
+      })
+      .catch(() => {
+        // Keep synchronous authoritative preset config if Firestore fetch fails or is offline
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentRoute.tenantSlug, resolvedState.isValid, resolvedState.tenantId]);
 
   useEffect(() => {
     const slug = currentRoute.tenantSlug;

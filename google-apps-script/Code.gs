@@ -19,9 +19,32 @@
  *    and never exposed to external callers.
  */
 
-// Target Client ID for this Google Apps Script Web App deployment
+// Target Client ID for this Google Apps Script Web App deployment (override in Script Properties: TARGET_CLIENT_ID)
 var DEFAULT_TARGET_CLIENT_ID = 'prodrain-plumbing-kochi';
 var TARGET_SHEET_NAME = 'Leads';
+
+// Helper: Normalize Script Property values (trims spaces and strips accidental surrounding quotes)
+function normalizeScriptProp(val) {
+  if (val === null || val === undefined) return '';
+  return val.toString().trim().replace(/^["']+|["']+$/g, '').trim();
+}
+
+// Helper: Resolve Target Spreadsheet (optional Script Property TARGET_SPREADSHEET_ID or active bound spreadsheet)
+function getTargetSpreadsheet() {
+  try {
+    var scriptProps = PropertiesService.getScriptProperties();
+    var rawProp = normalizeScriptProp(scriptProps.getProperty('TARGET_SPREADSHEET_ID'));
+    if (rawProp) {
+      var urlMatch = rawProp.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+      var targetId = urlMatch ? urlMatch[1] : rawProp;
+      return SpreadsheetApp.openById(targetId);
+    }
+  } catch (propErr) {
+    console.error("[LeadPilot] Failed to open TARGET_SPREADSHEET_ID spreadsheet:", propErr && propErr.message ? propErr.message : propErr);
+    return null;
+  }
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
 
 // Handle CORS Pre-flight Options Request
 function doOptions(e) {
@@ -30,12 +53,22 @@ function doOptions(e) {
   return output;
 }
 
-// Helper: Ensure the dedicated "Leads" tab exists in the active spreadsheet
+// Helper: Ensure the dedicated "Leads" tab exists in the target spreadsheet (case- & space-tolerant)
 function getOrCreateLeadsSheet(ss) {
   var sheet = ss.getSheetByName(TARGET_SHEET_NAME);
   if (!sheet) {
+    var allSheets = ss.getSheets();
+    var targetLower = TARGET_SHEET_NAME.toLowerCase();
+    for (var i = 0; i < allSheets.length; i++) {
+      if (allSheets[i].getName().toString().trim().toLowerCase() === targetLower) {
+        sheet = allSheets[i];
+        break;
+      }
+    }
+  }
+  if (!sheet) {
     var firstSheet = ss.getSheets()[0];
-    if (firstSheet && firstSheet.getName() === "Sheet1" && firstSheet.getLastRow() <= 1) {
+    if (firstSheet && firstSheet.getName().toString().trim().toLowerCase() === "sheet1" && firstSheet.getLastRow() <= 1) {
       firstSheet.setName(TARGET_SHEET_NAME);
       sheet = firstSheet;
     } else {
@@ -52,11 +85,29 @@ var DEFAULT_HEADERS = [
   "Lead Source", "Page URL", "Status", "Notes", "Follow-up Date"
 ];
 
-// Ensure Header row exists if sheet is fresh and format columns
+// Ensure Header row exists (even if Row 1 was blank-formatted) and format Phone column
 function ensureHeaderRow(sheet) {
-  if (sheet.getLastRow() === 0) {
-    sheet.appendRow(DEFAULT_HEADERS);
+  var lastRow = sheet.getLastRow();
+  var needsDefaultHeaders = lastRow === 0;
+
+  if (!needsDefaultHeaders) {
+    var colCheckCount = Math.max(sheet.getLastColumn(), DEFAULT_HEADERS.length);
+    var row1 = sheet.getRange(1, 1, 1, colCheckCount).getValues()[0];
+    var hasAnyHeaderText = false;
+    for (var i = 0; i < row1.length; i++) {
+      if ((row1[i] || "").toString().trim().length > 0) {
+        hasAnyHeaderText = true;
+        break;
+      }
+    }
+    if (!hasAnyHeaderText) {
+      needsDefaultHeaders = true;
+    }
+  }
+
+  if (needsDefaultHeaders) {
     var headerRange = sheet.getRange(1, 1, 1, DEFAULT_HEADERS.length);
+    headerRange.setValues([DEFAULT_HEADERS]);
     headerRange.setFontWeight("bold");
     headerRange.setBackground("#0f172a");
     headerRange.setFontColor("#ffffff");
@@ -67,7 +118,8 @@ function ensureHeaderRow(sheet) {
     var headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), DEFAULT_HEADERS.length)).getValues()[0];
     var colMap = getHeaderColumnMap(headers);
     if (colMap.phone !== undefined) {
-      sheet.getRange(1, colMap.phone + 1, Math.max(sheet.getMaxRows(), 100), 1).setNumberFormat('@');
+      var fmtRows = Math.min(Math.max(sheet.getLastRow() + 20, 100), Math.max(sheet.getMaxRows(), 100));
+      sheet.getRange(1, colMap.phone + 1, fmtRows, 1).setNumberFormat('@');
     }
   } catch (fmtErr) {
     console.warn("Could not set phone column text format:", fmtErr);
@@ -79,28 +131,47 @@ function getHeaderColumnMap(headers) {
   var map = {};
   for (var c = 0; c < headers.length; c++) {
     var raw = headers[c] ? headers[c].toString().toLowerCase().trim().replace(/[^a-z0-9]/g, '') : '';
-    if (raw === 'leadid' || raw === 'id' || raw === 'lead') map.id = c;
-    else if (raw === 'timestamp' || raw === 'date' || raw === 'createdat' || raw === 'createddate' || raw === 'time') map.timestamp = c;
+    if (raw === 'leadid' || raw === 'id' || raw === 'lead' || raw === 'refid' || raw === 'referenceid') map.id = c;
+    else if (raw === 'timestamp' || raw === 'date' || raw === 'createdat' || raw === 'createddate' || raw === 'time' || raw === 'submittedat' || raw === 'submittedon' || raw === 'leaddate') map.timestamp = c;
     else if (raw === 'clientid' || raw === 'client' || raw === 'tenant' || raw === 'tenantid') map.clientId = c;
     else if (raw === 'businessname' || raw === 'business' || raw === 'company' || raw === 'companyname') map.businessName = c;
-    else if (raw === 'name' || raw === 'customername' || raw === 'fullname' || raw === 'contactname' || raw === 'leadname' || raw === 'customer' || raw === 'person') map.name = c;
+    else if (raw === 'name' || raw === 'customername' || raw === 'fullname' || raw === 'contactname' || raw === 'leadname' || raw === 'customer' || raw === 'person' || raw === 'clientname' || raw === 'yourname') map.name = c;
     else if (
       raw === 'phone' || raw === 'phonenumber' || raw === 'phoneno' ||
       raw === 'mobile' || raw === 'mobilenumber' || raw === 'mobileno' ||
-      raw === 'telephone' || raw === 'contact' || raw === 'contactno' ||
-      raw === 'cell' || raw === 'cellphone' || raw === 'ph'
+      raw === 'telephone' || raw === 'contact' || raw === 'contactno' || raw === 'contactnumber' ||
+      raw === 'customerphone' || raw === 'clientphone' ||
+      raw === 'cell' || raw === 'cellphone' || raw === 'ph' || raw === 'whatsapp' || raw === 'whatsappnumber'
     ) map.phone = c;
     else if (raw === 'email' || raw === 'emailaddress' || raw === 'mail' || raw === 'emailid') map.email = c;
-    else if (raw === 'service' || raw === 'servicerequested' || raw === 'serviceneeded' || raw === 'requirement' || raw === 'job' || raw === 'category' || raw === 'work') map.service = c;
-    else if (raw === 'details' || raw === 'inquirydetails' || raw === 'message' || raw === 'notesdetails' || raw === 'description' || raw === 'remarks') map.details = c;
+    else if (raw === 'service' || raw === 'services' || raw === 'servicerequested' || raw === 'serviceneeded' || raw === 'servicetype' || raw === 'requirement' || raw === 'job' || raw === 'category' || raw === 'work') map.service = c;
+    else if (raw === 'details' || raw === 'inquirydetails' || raw === 'enquirydetails' || raw === 'message' || raw === 'notesdetails' || raw === 'description' || raw === 'remarks' || raw === 'inquiry' || raw === 'enquiry') map.details = c;
     else if (raw === 'address' || raw === 'streetaddress' || raw === 'location' || raw === 'city' || raw === 'area' || raw === 'place') map.address = c;
     else if (raw === 'leadsource' || raw === 'source' || raw === 'campaign' || raw === 'channel' || raw === 'medium') map.leadSource = c;
-    else if (raw === 'pageurl' || raw === 'url' || raw === 'website') map.pageUrl = c;
+    else if (raw === 'pageurl' || raw === 'url' || raw === 'website' || raw === 'sourceurl') map.pageUrl = c;
     else if (raw === 'status' || raw === 'leadstatus' || raw === 'stage' || raw === 'pipelinestatus') map.status = c;
-    else if (raw === 'notes' || raw === 'notesjson' || raw === 'logs' || raw === 'comments') map.notes = c;
+    else if (raw === 'notes' || raw === 'notesjson' || raw === 'logs' || raw === 'comments' || raw === 'notesandlogs') map.notes = c;
     else if (raw === 'followupdate' || raw === 'followup' || raw === 'nextfollowup' || raw === 'callbackdate') map.followUpDate = c;
   }
   return map;
+}
+
+// Helper: Locate next row index with real content (avoids appending rows off-screen below pre-formatted/checkbox rows)
+function findNextLeadWriteRow(sheet) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return 2;
+  var lastCol = Math.max(sheet.getLastColumn(), 1);
+  var values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  for (var r = values.length - 1; r >= 1; r--) {
+    var row = values[r];
+    for (var c = 0; c < row.length; c++) {
+      var cell = row[c];
+      if (cell instanceof Date) return r + 2;
+      if (typeof cell === 'number') return r + 2;
+      if (typeof cell === 'string' && cell.trim().length > 0) return r + 2;
+    }
+  }
+  return 2;
 }
 
 // Helper: Detect whether string is a legitimate phone number (e.g. +91XXXXXXXXXX, +1 (555) 234-5678)
@@ -133,9 +204,9 @@ function sanitizeFormulaPrefix(val) {
 function getTargetClientId() {
   try {
     var scriptProps = PropertiesService.getScriptProperties();
-    var prop = scriptProps.getProperty('TARGET_CLIENT_ID');
-    if (prop && prop.trim()) {
-      return prop.trim().toLowerCase();
+    var prop = normalizeScriptProp(scriptProps.getProperty('TARGET_CLIENT_ID'));
+    if (prop) {
+      return prop.toLowerCase();
     }
   } catch (e) {
     console.warn("ScriptProperties access notice:", e);
@@ -148,7 +219,15 @@ function getTargetClientId() {
  */
 function doGet(e) {
   try {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var ss = getTargetSpreadsheet();
+    if (!ss) {
+      console.error("[LeadPilot] doGet failed: Target spreadsheet unavailable.");
+      return responseJSON({
+        status: "error",
+        result: "error",
+        message: "Target spreadsheet is unavailable. Configure TARGET_SPREADSHEET_ID or bind script to the spreadsheet."
+      });
+    }
     var sheet = getOrCreateLeadsSheet(ss);
     ensureHeaderRow(sheet);
 
@@ -191,13 +270,13 @@ function doGet(e) {
  */
 function handleGetLeads(sheet, ss, params) {
   var scriptProps = PropertiesService.getScriptProperties();
-  var configuredApiKey = scriptProps.getProperty('API_KEY');
+  var configuredApiKey = normalizeScriptProp(scriptProps.getProperty('API_KEY'));
   var targetClientId = getTargetClientId();
   var requestedClientId = (params.clientId || "").toString().trim().toLowerCase();
   var callerToken = (params.apiKey || params.token || "").toString().trim();
 
   // 1. Strict Authentication Gate: API_KEY must be set in Script Properties AND must match caller
-  if (!configuredApiKey || !configuredApiKey.trim() || !callerToken || callerToken !== configuredApiKey.trim()) {
+  if (!configuredApiKey || !callerToken || callerToken !== configuredApiKey.trim()) {
     return responseJSON({
       status: "error",
       result: "error",
@@ -381,23 +460,42 @@ function doPost(e) {
     var data = {};
     if (e && e.postData && e.postData.contents) {
       try {
-        data = JSON.parse(e.postData.contents);
+        data = JSON.parse(e.postData.contents.toString().trim());
       } catch (jsonErr) {
+        console.warn("[LeadPilot] doPost JSON parse fallback to form parameters.");
         data = e.parameter || {};
       }
     } else if (e && e.parameter) {
       data = e.parameter;
     }
 
-    var action = data.action || "createLead";
-    var callerToken = data.apiKey || data.token || (e && e.parameter && (e.parameter.apiKey || e.parameter.token)) || "";
+    var action = (data.action || "createLead").toString().trim();
+    var callerToken = (data.apiKey || data.token || (e && e.parameter && (e.parameter.apiKey || e.parameter.token)) || "").toString().trim();
     var scriptProps = PropertiesService.getScriptProperties();
-    var configuredApiKey = scriptProps.getProperty('API_KEY');
+    var configuredApiKey = normalizeScriptProp(scriptProps.getProperty('API_KEY'));
     var targetClientId = getTargetClientId();
 
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var ss = getTargetSpreadsheet();
+    if (!ss) {
+      console.error("[LeadPilot] doPost aborted: No active or configured spreadsheet (check TARGET_SPREADSHEET_ID).");
+      return responseJSON({
+        status: "error",
+        result: "error",
+        message: "Target spreadsheet is unavailable. Bind this script to the target Google Sheet or set TARGET_SPREADSHEET_ID in Script Properties."
+      });
+    }
+
     var sheet = getOrCreateLeadsSheet(ss);
     ensureHeaderRow(sheet);
+
+    console.log("[LeadPilot] doPost received", {
+      action: action,
+      incomingClientId: (data.clientId || "").toString().trim().toLowerCase() || "(missing)",
+      targetClientId: targetClientId,
+      spreadsheetId: ss.getId(),
+      spreadsheetTitle: ss.getName(),
+      sheetName: sheet.getName()
+    });
 
     // 1. Authenticated getLeads via POST
     if (action === "getLeads") {
@@ -406,7 +504,8 @@ function doPost(e) {
 
     // 2. Deny-by-default for CRM mutations/deletions: Requires valid API_KEY
     if (action !== "createLead") {
-      if (!configuredApiKey || !configuredApiKey.trim() || callerToken !== configuredApiKey.trim()) {
+      if (!configuredApiKey || callerToken !== configuredApiKey.trim()) {
+        console.warn("[LeadPilot] doPost unauthorized mutation blocked", { action: action, clientId: (data.clientId || "").toString().trim().toLowerCase() });
         return responseJSON({
           status: "error",
           result: "error",
@@ -417,6 +516,7 @@ function doPost(e) {
 
     // 3. Honeypot Anti-Spam Check: If hidden bot traps are filled, silently drop
     if (data.website_hp || data.company_url || data.fax_number) {
+      console.log("[LeadPilot] doPost skipped: honeypot field populated.");
       return responseJSON({
         status: "success",
         result: "success",
@@ -424,8 +524,10 @@ function doPost(e) {
       });
     }
 
-    // 4. Validate Client ID
-    if (!data.clientId || typeof data.clientId !== 'string' || !data.clientId.trim()) {
+    // 4. Validate Client ID (accepts clientId or tenantId alias)
+    var rawIncomingClientId = data.clientId || data.tenantId || "";
+    if (!rawIncomingClientId || typeof rawIncomingClientId !== 'string' || !rawIncomingClientId.trim()) {
+      console.warn("[LeadPilot] doPost rejected: missing clientId.");
       return responseJSON({
         status: "error",
         result: "error",
@@ -433,8 +535,9 @@ function doPost(e) {
       });
     }
 
-    var clientId = data.clientId.toString().trim().toLowerCase();
+    var clientId = rawIncomingClientId.toString().trim().toLowerCase();
     if (!/^[a-zA-Z0-9_-]+$/.test(clientId) || clientId.length > 64) {
+      console.warn("[LeadPilot] doPost rejected: invalid clientId format.");
       return responseJSON({
         status: "error",
         result: "error",
@@ -444,6 +547,12 @@ function doPost(e) {
 
     // Restrict submissions strictly to the configured tenant
     if (targetClientId !== clientId) {
+      console.warn("[LeadPilot] doPost rejected: tenant mismatch", {
+        incomingClientId: clientId,
+        targetClientId: targetClientId,
+        spreadsheetId: ss.getId(),
+        sheetName: sheet.getName()
+      });
       return responseJSON({
         status: "error",
         result: "error",
@@ -452,7 +561,7 @@ function doPost(e) {
     }
 
     var allData = sheet.getDataRange().getValues();
-    var existingHeaders = allData[0];
+    var existingHeaders = allData[0] || [];
     var targetColMap = getHeaderColumnMap(existingHeaders);
 
     function findRowByLeadId(targetId) {
@@ -652,6 +761,7 @@ function doPost(e) {
     // Validate that at least Name (min 2 chars) or Phone (min 5 digits) is provided
     var phoneDigits = rawPhone.replace(/\D/g, '');
     if (rawName.length < 2 && phoneDigits.length < 5) {
+      console.warn("[LeadPilot] createLead rejected: validation failed (missing name/phone).", { clientId: clientId });
       return responseJSON({
         status: "error",
         result: "error",
@@ -662,11 +772,11 @@ function doPost(e) {
     // Build sanitized fields with Formula Injection Protection
     var leadId = sanitizeFormulaPrefix(data.id || ("LP-" + Utilities.formatDate(new Date(), "GMT", "yyyyMMdd") + "-" + Utilities.getUuid().slice(0, 4)));
     var timestamp = data.timestamp || new Date().toISOString();
-    var businessName = sanitizeFormulaPrefix(data.businessName || "ProDrain Plumbing");
+    var businessName = sanitizeFormulaPrefix(data.businessName || clientId);
     var name = sanitizeFormulaPrefix(rawName || "Anonymous");
     var phone = sanitizeFormulaPrefix(rawPhone);
     var email = sanitizeFormulaPrefix(rawEmail);
-    var service = sanitizeFormulaPrefix((data.service || "Plumbing Enquiry").toString().trim().slice(0, 150));
+    var service = sanitizeFormulaPrefix((data.service || "General Enquiry").toString().trim().slice(0, 150));
     var details = sanitizeFormulaPrefix((data.details || "").toString().trim().slice(0, 1000));
     if (email && details.indexOf(email) === -1) {
       details = details ? (details + " | Email: " + email) : ("Email: " + email);
@@ -681,8 +791,18 @@ function doPost(e) {
       notesJson = JSON.stringify(data.notes.slice(0, 10));
     }
 
-    // Dynamic Column Mapping to preserve existing spreadsheet order
+    // Ensure mapped columns exist (in case header row had unrecognizable/blank cells)
     var targetColMap = getHeaderColumnMap(existingHeaders);
+    if (Object.keys(targetColMap).length === 0) {
+      sheet.getRange(1, 1, 1, DEFAULT_HEADERS.length).setValues([DEFAULT_HEADERS]);
+      existingHeaders = DEFAULT_HEADERS;
+      targetColMap = getHeaderColumnMap(existingHeaders);
+      console.warn("[LeadPilot] Existing Row 1 had no recognized LeadPilot headers; initialized default headers.", {
+        spreadsheetId: ss.getId(),
+        sheetName: sheet.getName()
+      });
+    }
+
     var rowToAppend = [];
     for (var c = 0; c < existingHeaders.length; c++) {
       if (targetColMap.id === c) rowToAppend.push(leadId);
@@ -703,29 +823,81 @@ function doPost(e) {
       else rowToAppend.push("");
     }
 
-    sheet.appendRow(rowToAppend);
-    var newRowIdx = sheet.getLastRow();
+    var targetWriteRow = findNextLeadWriteRow(sheet);
+    if (targetWriteRow > sheet.getLastRow()) {
+      sheet.appendRow(rowToAppend);
+      targetWriteRow = sheet.getLastRow();
+    } else {
+      sheet.getRange(targetWriteRow, 1, 1, rowToAppend.length).setValues([rowToAppend]);
+    }
+    var newRowIdx = targetWriteRow;
 
-    // Ensure Phone column on newly appended row is explicitly formatted as plain text (@)
+    // Ensure Phone column on newly written row is explicitly formatted as plain text (@)
     if (targetColMap.phone !== undefined) {
       try {
-        sheet.getRange(newRowIdx, targetColMap.phone + 1).setNumberFormat('@');
+        sheet.getRange(newRowIdx, targetColMap.phone + 1).setNumberFormat('@').setValue(phone);
       } catch (phoneFmtErr) {
         console.warn("Could not set phone cell text format:", phoneFmtErr);
       }
     }
 
+    SpreadsheetApp.flush();
+
+    // Verify that the written row actually persisted to the target row before returning success
+    var verifyValues = sheet.getRange(newRowIdx, 1, 1, existingHeaders.length).getValues()[0];
+    var wroteId = targetColMap.id !== undefined ? (verifyValues[targetColMap.id] || "").toString().trim() : "";
+    var wroteName = targetColMap.name !== undefined ? (verifyValues[targetColMap.name] || "").toString().trim() : "";
+    var wrotePhone = targetColMap.phone !== undefined ? (verifyValues[targetColMap.phone] || "").toString().trim() : "";
+    var writeVerified = Boolean(
+      (targetColMap.id !== undefined && wroteId === leadId) ||
+      (targetColMap.name !== undefined && wroteName.length > 0) ||
+      (targetColMap.phone !== undefined && wrotePhone.length > 0)
+    );
+
+    if (!writeVerified) {
+      console.error("[LeadPilot] createLead verification failed: row empty after write", {
+        writeSucceeded: false,
+        leadId: leadId,
+        clientId: clientId,
+        spreadsheetId: ss.getId(),
+        sheetName: sheet.getName(),
+        rowNumber: newRowIdx
+      });
+      return responseJSON({
+        status: "error",
+        result: "error",
+        writeVerified: false,
+        leadId: leadId,
+        clientId: clientId,
+        message: "Google Sheet write could not be verified after flush."
+      });
+    }
+
+    console.log("[LeadPilot] createLead succeeded", {
+      writeSucceeded: true,
+      writeVerified: true,
+      leadId: leadId,
+      clientId: clientId,
+      spreadsheetId: ss.getId(),
+      spreadsheetTitle: ss.getName(),
+      sheetName: sheet.getName(),
+      rowNumber: newRowIdx,
+      mappedColumns: Object.keys(targetColMap).join(',')
+    });
+
     // Sanitized response: Zero internal spreadsheet name disclosure
     return responseJSON({
       status: "success",
       result: "success",
+      writeVerified: true,
+      rowNumber: newRowIdx,
       leadId: leadId,
       clientId: clientId,
       message: "Lead recorded in Google Sheet successfully."
     });
 
   } catch (err) {
-    console.error("doPost internal error:", err);
+    console.error("[LeadPilot] doPost internal error:", err && err.message ? err.message : err);
     return responseJSON({
       status: "error",
       result: "error",
@@ -749,8 +921,9 @@ function responseJSON(data) {
  */
 function autoAssignMissingLeadIds() {
   try {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheet = ss.getSheetByName(TARGET_SHEET_NAME);
+    var ss = getTargetSpreadsheet();
+    if (!ss) return;
+    var sheet = getOrCreateLeadsSheet(ss);
     if (!sheet || sheet.getLastRow() <= 1) return;
 
     var values = sheet.getDataRange().getValues();

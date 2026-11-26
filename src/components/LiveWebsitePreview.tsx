@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { ClientConfig, LeadItem } from '../types';
-import { saveLead, getStoredLeads } from '../utils/leadStorage';
+import { saveLead, getStoredLeads, wasLeadSheetSyncFailed } from '../utils/leadStorage';
 import { resolveTenantFormEndpoint } from '../config/clientConfigResolver';
 import { detectDefaultCountryCode, formatPhoneForWhatsApp } from '../utils/phoneUtils';
 import {
@@ -170,18 +170,19 @@ export const LiveWebsitePreview: React.FC<LiveWebsitePreviewProps> = ({ config, 
 
     const cleanEmail = formData.email ? formData.email.trim() : '';
 
-    // Prevent duplicate submissions within short 2-minute window while preserving confirmation details
+    // Prevent duplicate submissions within short 2-minute window unless previous Sheet sync failed
     const stored = getStoredLeads(cleanTenant);
     const twoMinsAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
     const matchedDuplicate = stored.find(
       (l) =>
+        !wasLeadSheetSyncFailed(l.id) &&
         l.phone.replace(/\D/g, '') === cleanPhone.replace(/\D/g, '') &&
         l.service.toLowerCase() === cleanService.toLowerCase() &&
         l.timestamp >= twoMinsAgo
     );
 
     if (matchedDuplicate) {
-      setSubmittedPayload(matchedDuplicate);
+      setSubmittedPayload({ ...matchedDuplicate, sheetSynced: true });
       setWhatsAppRedirectClicked(false);
       setFormSubmitted(true);
       setFormSubmitting(false);
@@ -207,15 +208,18 @@ export const LiveWebsitePreview: React.FC<LiveWebsitePreviewProps> = ({ config, 
     };
 
     try {
-      // saveLead saves to Firestore and syncs to Google Apps Script Web App remotely if endpoint is provided
-      const res = await saveLead(leadPayload, endpoint);
+      // saveLead saves to Firestore and syncs to Google Apps Script Web App remotely if endpoint or Cloudflare gateway is active.
+      // In client mode, Sheet sync must succeed rather than silently reporting success when unconfigured or failing.
+      const res = await saveLead(leadPayload, endpoint, {
+        requireSheetSync: appMode === 'client',
+      });
       if (!res.success) {
         setFormError(res.message || 'Something went wrong while submitting. Please call us directly.');
         return;
       }
-      const savedLead = res.lead;
+      const savedLead = { ...res.lead, sheetSynced: res.sheetSynced };
 
-      if (!endpoint) {
+      if (!endpoint && !res.sheetSynced) {
         // Simulation delay for local Demo Mode
         await new Promise((resolve) => setTimeout(resolve, 600));
       }
@@ -546,6 +550,11 @@ export const LiveWebsitePreview: React.FC<LiveWebsitePreviewProps> = ({ config, 
                             <span className="font-semibold">Contact:</span> {submittedPayload.phone}
                           </div>
                         )}
+                        <div className="pt-1 border-t border-emerald-100 text-[11px] font-bold text-emerald-700">
+                          {submittedPayload.sheetSynced
+                            ? 'Saved to CRM & synced to Google Sheet ✓'
+                            : 'Saved to CRM (local preview mode — configure Google Apps Script URL to sync Sheets)'}
+                        </div>
                       </div>
                     )}
 

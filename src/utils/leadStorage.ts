@@ -373,7 +373,14 @@ export function generateLeadId(existingCount: number = 0): string {
   return candidate;
 }
 
+const failedSheetSyncLeadIds = new Set<string>();
+
+export function wasLeadSheetSyncFailed(leadId?: string): boolean {
+  return Boolean(leadId && failedSheetSyncLeadIds.has(leadId));
+}
+
 export interface SaveLeadOptions {
+  requireSheetSync?: boolean;
   persistLeadToFirestore?: (params: {
     tenantId: string;
     leadId: string;
@@ -388,12 +395,13 @@ export async function saveLead(
   input: Partial<LeadItem> & { name: string; phone: string; service: string },
   endpointUrl?: string,
   options?: SaveLeadOptions
-): Promise<{ success: boolean; message: string; lead: LeadItem }> {
+): Promise<{ success: boolean; message: string; lead: LeadItem; sheetSynced: boolean; sheetMessage?: string }> {
   if (!input.clientId || !input.clientId.trim()) {
     return {
       success: false,
       message: 'Client ID is required to submit an enquiry.',
       lead: null as any,
+      sheetSynced: false,
     };
   }
 
@@ -403,6 +411,7 @@ export async function saveLead(
       success: false,
       message: 'Invalid Client ID format for enquiry submission.',
       lead: null as any,
+      sheetSynced: false,
     };
   }
 
@@ -414,6 +423,7 @@ export async function saveLead(
     const fiveMinsAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
     existingIndex = leads.findIndex(
       (l) =>
+        !failedSheetSyncLeadIds.has(l.id) &&
         l.phone.replace(/\D/g, '') === input.phone.replace(/\D/g, '') &&
         l.service.toLowerCase() === input.service.toLowerCase() &&
         l.timestamp >= fiveMinsAgo
@@ -447,6 +457,7 @@ export async function saveLead(
         success: true,
         message: 'Enquiry already received — our team has your request.',
         lead: targetLead,
+        sheetSynced: !failedSheetSyncLeadIds.has(targetLead.id),
       };
     }
   } else {
@@ -516,27 +527,45 @@ export async function saveLead(
     firestoreErrDetail = firestoreErr?.message || 'Database permission or connection error';
   }
 
-  // 3. Optional Google Sheet webhook sync if configured
+  // 3. Google Sheet synchronization (via explicit endpointUrl or Cloudflare Pages /api/submit-lead)
+  const cleanEndpoint = typeof endpointUrl === 'string' ? endpointUrl.trim() : '';
+  const hasRemoteEndpoint = cleanEndpoint.startsWith('http');
+  const shouldAttemptSheetSync = hasRemoteEndpoint || isCloudflareGatewayMode() || Boolean(options?.requireSheetSync);
+
   let syncMessage = '';
-  if (endpointUrl && endpointUrl.startsWith('http')) {
+  let sheetSynced = false;
+  let sheetMessage: string | undefined;
+
+  if (shouldAttemptSheetSync) {
     try {
-      const syncRes = await syncLeadActionToRemote(endpointUrl, { action: 'createLead', ...targetLead });
-      if (syncRes.success) {
+      const syncRes = await syncLeadActionToRemote(cleanEndpoint, { action: 'createLead', ...targetLead });
+      if (syncRes.success && syncRes.result?.writeVerified !== false) {
+        failedSheetSyncLeadIds.delete(targetLead.id);
+        sheetSynced = true;
+        sheetMessage = syncRes.message || 'Recorded in Google Sheet successfully.';
         syncMessage = ' and synced to Google Sheet';
       } else {
-        console.error('Google Sheet sync failure:', syncRes.message);
+        failedSheetSyncLeadIds.add(targetLead.id);
+        sheetMessage = syncRes.message || 'Google Sheet did not confirm row creation.';
+        console.error('Google Sheet sync failure:', sheetMessage);
         return {
           success: false,
-          message: `Google Sheet recording error: ${syncRes.message}`,
+          message: `Google Sheet recording error: ${sheetMessage}`,
           lead: targetLead,
+          sheetSynced: false,
+          sheetMessage,
         };
       }
     } catch (e: any) {
+      failedSheetSyncLeadIds.add(targetLead.id);
+      sheetMessage = e?.message || 'Check connection';
       console.error('Google Sheet sync exception:', e);
       return {
         success: false,
-        message: `Network error connecting to Google Sheet Web App: ${e?.message || 'Check connection'}`,
+        message: `Network error connecting to Google Sheet Web App: ${sheetMessage}`,
         lead: targetLead,
+        sheetSynced: false,
+        sheetMessage,
       };
     }
   }
@@ -545,12 +574,20 @@ export async function saveLead(
   if (firestoreErrDetail) {
     return {
       success: false,
-      message: `Enquiry logged to Google Sheet, but CRM database write failed: ${firestoreErrDetail}.`,
+      message: `${sheetSynced ? 'Enquiry logged to Google Sheet, but ' : ''}CRM database write failed: ${firestoreErrDetail}.`,
       lead: targetLead,
+      sheetSynced,
+      sheetMessage,
     };
   }
 
-  return { success: true, message: `Lead saved to CRM${syncMessage}.`, lead: targetLead };
+  return {
+    success: true,
+    message: `Lead saved to CRM${syncMessage}.`,
+    lead: targetLead,
+    sheetSynced,
+    sheetMessage,
+  };
 }
 
 function canSyncRemoteAction(endpointUrl?: string): boolean {
@@ -1247,7 +1284,75 @@ export async function syncLeadActionToRemote(
     }
   }
 
-  if (!endpointUrl || !endpointUrl.trim() || !endpointUrl.startsWith('http')) {
+  // On Cloudflare Pages deployments, route public createLead enquiries through /api/submit-lead
+  // so server-authoritative APPSCRIPT_ENDPOINT_<TENANT> configuration is used seamlessly.
+  // If /api/submit-lead is unmounted/unconfigured while a direct browser endpointUrl is present,
+  // fall through cleanly to direct Apps Script POST below.
+  if (action === 'createLead' && cleanTenant && isCloudflareGatewayMode()) {
+    try {
+      const gatewayRes = await fetch('/api/submit-lead', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          ...payload,
+          action: 'createLead',
+          clientId: cleanTenant,
+        }),
+      });
+
+      let gatewayJson: any = null;
+      try {
+        gatewayJson = await gatewayRes.json();
+      } catch {
+        // non-JSON response (e.g. HTML 404/200 SPA fallback)
+      }
+
+      const gatewayNotMounted = gatewayRes.status === 404 || gatewayRes.status === 405 || !gatewayJson;
+      const gatewayUnconfigured =
+        gatewayRes.status === 403 &&
+        typeof gatewayJson?.message === 'string' &&
+        gatewayJson.message.includes('not configured on the gateway');
+
+      if (!gatewayNotMounted && !gatewayUnconfigured) {
+        const isSuccess = Boolean(
+          gatewayRes.ok &&
+            gatewayJson &&
+            (gatewayJson.result === 'success' || gatewayJson.status === 'success' || gatewayJson.status === 'ok') &&
+            gatewayJson.writeVerified !== false
+        );
+        return {
+          success: isSuccess,
+          result: gatewayJson,
+          message:
+            gatewayJson?.message ||
+            (isSuccess
+              ? 'Synced to Google Sheet via Cloudflare gateway'
+              : `Gateway rejected Google Sheet write (HTTP ${gatewayRes.status})`),
+        };
+      }
+
+      if (!endpointUrl || !endpointUrl.trim() || !endpointUrl.trim().startsWith('http')) {
+        return {
+          success: false,
+          result: gatewayJson,
+          message:
+            gatewayJson?.message ||
+            'Google Apps Script URL is missing or unconfigured in CONFIG.formEndpoint.',
+        };
+      }
+    } catch (err: any) {
+      if (!endpointUrl || !endpointUrl.trim() || !endpointUrl.trim().startsWith('http')) {
+        return {
+          success: false,
+          message: `Public submission gateway (/api/submit-lead) error: ${err?.message || 'Network error'}`,
+        };
+      }
+    }
+  }
+
+  if (!endpointUrl || !endpointUrl.trim() || !endpointUrl.trim().startsWith('http')) {
     return { success: false, message: 'Google Apps Script URL is missing or unconfigured in CONFIG.formEndpoint.' };
   }
 
@@ -1275,11 +1380,17 @@ export async function syncLeadActionToRemote(
       };
     }
 
-    const isSuccess = Boolean(json && (json.result === 'success' || json.status === 'success' || json.status === 'ok'));
+    const isSuccess = Boolean(
+      json &&
+        (json.result === 'success' || json.status === 'success' || json.status === 'ok') &&
+        json.writeVerified !== false
+    );
     return {
       success: isSuccess,
       result: json,
-      message: json?.message || (isSuccess ? 'Synced to Google Sheet successfully' : 'Google Apps Script reported an issue'),
+      message:
+        json?.message ||
+        (isSuccess ? 'Synced to Google Sheet successfully' : 'Google Apps Script did not confirm a verified write'),
     };
   } catch (err: any) {
     return {

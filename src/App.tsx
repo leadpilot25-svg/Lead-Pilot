@@ -17,7 +17,7 @@ import {
   INITIAL_CLIENT_CONFIGS,
   getClientConfigForEnvClientId,
 } from './config/clientConfigResolver';
-import { resolvePublicTenantWebsiteBySlug } from './auth/clientAuth';
+import { resolvePublicTenantWebsiteBySlug, fetchPublicWebsiteConfig, hydratePublicClientConfig } from './auth/clientAuth';
 import { PortalNotFound } from './components/PortalNotFound';
 import { ArrowLeft } from 'lucide-react';
 
@@ -204,6 +204,62 @@ export default function App() {
       isCancelled = true;
     };
   }, [currentRoute.tenantSlug, currentRoute.isCrmRoute, activeTarget]);
+
+  // Hydrate hostname-mapped root tenant config (e.g. leadpilot-staging.pages.dev -> roofing-client-01)
+  // from /tenants/{tenantId}/public/website so saved CONFIG.formEndpoint and website updates apply on '/'.
+  useEffect(() => {
+    if (
+      IS_CRM_DEPLOYMENT ||
+      activeTarget === 'crm' ||
+      currentRoute.isCrmRoute ||
+      currentRoute.tenantSlug ||
+      !authoritativeTenant.isValid ||
+      !authoritativeTenant.tenantId ||
+      !authoritativeTenant.config
+    ) {
+      return;
+    }
+
+    const baseConfig = authoritativeTenant.config;
+    const targetTenantId = authoritativeTenant.tenantId.trim().toLowerCase();
+    let isCancelled = false;
+
+    fetchPublicWebsiteConfig(targetTenantId)
+      .then((res) => {
+        if (isCancelled) return;
+        if (res.success && res.isPublished && res.config) {
+          const mergedRaw: Partial<ClientConfig> = {
+            ...baseConfig,
+            ...res.config,
+            formEndpoint: (res.config.formEndpoint || baseConfig.formEndpoint || '').trim(),
+          };
+          const hydrated = hydratePublicClientConfig(
+            targetTenantId,
+            mergedRaw,
+            res.businessName || baseConfig.businessName
+          );
+          setCurrentConfig((prev) => {
+            if (prev && prev.clientId && prev.clientId.toLowerCase() !== targetTenantId) {
+              return prev;
+            }
+            return hydrated;
+          });
+        }
+      })
+      .catch(() => {
+        // Keep synchronous authoritative preset config if Firestore fetch fails or is offline
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [
+    currentRoute.tenantSlug,
+    currentRoute.isCrmRoute,
+    activeTarget,
+    authoritativeTenant.isValid,
+    authoritativeTenant.tenantId,
+  ]);
 
   // Persist master client configs to localStorage in dev mode
   useEffect(() => {
