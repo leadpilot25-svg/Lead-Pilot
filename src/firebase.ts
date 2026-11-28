@@ -1,4 +1,4 @@
-import { initializeApp, getApps } from 'firebase/app';
+import { initializeApp, getApps, FirebaseApp } from 'firebase/app';
 import {
   getAuth,
   browserLocalPersistence,
@@ -6,21 +6,40 @@ import {
   getRedirectResult,
   UserCredential,
 } from 'firebase/auth';
-import { getFirestore, doc, getDocFromServer } from 'firebase/firestore';
+import {
+  getFirestore,
+  initializeFirestore,
+  Firestore,
+  doc,
+  getDocFromServer,
+} from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
-const app = initializeApp(firebaseConfig);
+const app = getApps().find((a) => a.name === '[DEFAULT]') || initializeApp(firebaseConfig);
+
+function createFirestoreInstance(firebaseApp: FirebaseApp): Firestore {
+  try {
+    return initializeFirestore(
+      firebaseApp,
+      { experimentalAutoDetectLongPolling: true },
+      firebaseConfig.firestoreDatabaseId
+    );
+  } catch {
+    return getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
+  }
+}
 
 // CRITICAL: The app will break without specifying firestoreDatabaseId
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+export const db = createFirestoreInstance(app);
 export const auth = getAuth(app);
 
 // Explicitly configure local persistence to survive redirects and page reloads
-if (typeof window !== 'undefined') {
-  setPersistence(auth, browserLocalPersistence).catch((err) => {
-    console.warn('Could not set Firebase Auth persistence:', err);
-  });
-}
+const persistenceReadyPromise: Promise<void> =
+  typeof window !== 'undefined'
+    ? setPersistence(auth, browserLocalPersistence).catch((err) => {
+        console.warn('Could not set Firebase Auth persistence:', err);
+      })
+    : Promise.resolve();
 
 // Global top-level redirect capture executed immediately on script evaluation
 export interface GlobalRedirectState {
@@ -51,7 +70,8 @@ export function getGlobalRedirectState() {
 }
 
 if (typeof window !== 'undefined') {
-  getRedirectResult(auth)
+  persistenceReadyPromise
+    .then(() => getRedirectResult(auth))
     .then((result) => {
       redirectState = { isChecking: false, result, error: null };
       if (result?.user) {
@@ -85,7 +105,7 @@ export function getSecondaryProvisioningAuth() {
 }
 
 export function getSecondaryProvisioningDb() {
-  return getFirestore(getSecondaryProvisioningApp(), firebaseConfig.firestoreDatabaseId);
+  return createFirestoreInstance(getSecondaryProvisioningApp());
 }
 
 export enum OperationType {
@@ -135,13 +155,52 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   throw new Error(JSON.stringify(errInfo));
 }
 
+function isTransientNetworkAuthError(err: unknown): boolean {
+  const code = (err as any)?.code || '';
+  const message = err instanceof Error ? err.message : String(err || '');
+  return (
+    code === 'auth/network-request-failed' ||
+    message.includes('auth/network-request-failed') ||
+    message.includes('Fetching auth token failed')
+  );
+}
+
 // Validation connection to Firestore on boot
 export async function testConnection(): Promise<boolean> {
+  if (typeof window === 'undefined') {
+    return true;
+  }
+
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return false;
+  }
+
   try {
+    await persistenceReadyPromise;
+    if (typeof (auth as any).authStateReady === 'function') {
+      await (auth as any).authStateReady();
+    }
+
+    if (auth.currentUser) {
+      try {
+        await auth.currentUser.getIdToken();
+      } catch (tokenErr) {
+        if (isTransientNetworkAuthError(tokenErr)) {
+          console.warn('Skipping Firestore boot connection check while auth token refresh is offline.');
+          return false;
+        }
+      }
+    }
+
     await getDocFromServer(doc(db, 'test', 'connection'));
     return true;
   } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
+    const message = error instanceof Error ? error.message : String(error || '');
+    if (isTransientNetworkAuthError(error) || (typeof navigator !== 'undefined' && navigator.onLine === false)) {
+      console.warn('Firestore connection check deferred because network is currently unavailable.');
+      return false;
+    }
+    if (message.includes('the client is offline')) {
       console.error('Please check your Firebase configuration.');
       return false;
     }
@@ -150,7 +209,9 @@ export async function testConnection(): Promise<boolean> {
   }
 }
 
-// Initial connection test
-testConnection().catch(() => {});
+// Initial connection test (browser only)
+if (typeof window !== 'undefined') {
+  testConnection().catch(() => {});
+}
 
 export default app;

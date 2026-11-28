@@ -4,6 +4,12 @@
   "exclude": [
     "/assets/*",
     "/downloads/*",
-    "/favicon.ico"
+    "/favicon.ico",
+    "/manifest.webmanifest",
+    "/sw.js",
+    "/workbox-*.js",
+    "/pwa-*.png",
+    "/apple-touch-icon.png",
+    "/icon.svg"
   ]
 }

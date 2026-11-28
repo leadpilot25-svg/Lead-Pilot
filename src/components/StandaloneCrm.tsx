@@ -17,10 +17,26 @@ import {
   clearLastGoogleOnboardingError,
 } from '../auth/clientAuth';
 import { auth } from '../firebase';
-import { LeadPilotDashboard } from './LeadPilotDashboard';
+import { LeadPilotDashboard, CrmPrimaryNav } from './LeadPilotDashboard';
 import { SuperAdminClientDirectory } from './SuperAdminClientDirectory';
-import { TenantStaffManager } from './TenantStaffManager';
-import { Building2, LogOut, ShieldCheck, UserCheck, Lock, Mail, Key, AlertCircle, RefreshCw, Users, Kanban, UserPlus, CheckCircle2 } from 'lucide-react';
+import {
+  Building2,
+  LogOut,
+  ShieldCheck,
+  UserCheck,
+  Lock,
+  Mail,
+  Key,
+  AlertCircle,
+  RefreshCw,
+  Users,
+  ListChecks,
+  Clock,
+  SlidersHorizontal,
+  UserPlus,
+  CheckCircle2,
+  ChevronDown,
+} from 'lucide-react';
 import { CLIENT_PRESETS, DEMO_CLIENT_CONFIG } from '../presets/clientPresets';
 import { INDUSTRY_PRESETS } from '../presets/industryPresets';
 import { migrateLocalStorageToFirestore } from '../utils/leadStorage';
@@ -44,7 +60,9 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
   const [isAuthResolving, setIsAuthResolving] = useState<boolean>(() => !getCurrentClientSession());
   const [adminSelectedTenant, setAdminSelectedTenant] = useState<string>('');
   const [adminViewMode, setAdminViewMode] = useState<'crm' | 'directory'>('crm');
-  const [clientViewMode, setClientViewMode] = useState<'crm' | 'team'>('crm');
+  const [primaryNav, setPrimaryNav] = useState<CrmPrimaryNav>('leads');
+  const [followUpsDueCount, setFollowUpsDueCount] = useState<number>(0);
+  const [isAccountMenuOpen, setIsAccountMenuOpen] = useState<boolean>(false);
   const [firestoreWebsiteConfig, setFirestoreWebsiteConfig] = useState<{
     tenantId: string;
     config: Partial<ClientConfig>;
@@ -286,6 +304,8 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
     setIsVerifiedAdmin(false);
     setIsRootAdmin(false);
     setAdminViewMode('crm');
+    setPrimaryNav('leads');
+    setIsAccountMenuOpen(false);
     setAdminSelectedTenant('');
     setOnboardingError(null);
     setTenantAccessState('checking');
@@ -641,185 +661,224 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
     );
   }
 
+  const activeDisplayName = currentUser.businessName || resolvedConfig.businessName || 'LeadPilot CRM';
+  const roleDisplayLabel = isRootAdmin
+    ? 'Root Admin'
+    : isVerifiedAdmin
+    ? 'Admin'
+    : currentUser.role === 'client_staff'
+    ? 'Staff'
+    : 'Owner';
+
+  const handleSelectPrimaryNav = (nav: CrmPrimaryNav) => {
+    setAdminViewMode('crm');
+    setPrimaryNav(nav);
+    setIsAccountMenuOpen(false);
+  };
+
   // Authenticated Client CRM View
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans">
-      {/* Migration Notification Banner */}
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans overflow-x-hidden">
+      {/* Compact Migration Notification Banner */}
       {migrationStatus && (
-        <div className="bg-emerald-950/80 border-b border-emerald-500/40 px-4 py-2 text-xs text-emerald-300 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-400" />
-            <span>{migrationStatus}</span>
+        <div className="bg-emerald-950/70 border-b border-emerald-500/30 px-4 py-2 text-xs text-emerald-200 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-400 shrink-0" />
+            <span className="truncate">{migrationStatus}</span>
           </div>
           <button
+            type="button"
             onClick={() => setMigrationStatus(null)}
-            className="text-slate-400 hover:text-white text-xs font-bold"
+            className="text-slate-300 hover:text-white text-xs font-semibold shrink-0 cursor-pointer"
           >
             Dismiss
           </button>
         </div>
       )}
 
-      {/* Client-Facing Navigation Header */}
-      <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-40 shadow-md">
-        <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="bg-emerald-600 p-2 rounded-xl text-white shadow-md">
-              <Building2 className="w-5 h-5" />
+      {/* Compact Single-Row Top Header */}
+      <header className="bg-slate-900/95 backdrop-blur-md border-b border-slate-800 sticky top-0 z-40">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-14 sm:h-16 flex items-center justify-between gap-4 sm:gap-8">
+          {/* Zone 1: Brand / Business Name */}
+          <button
+            type="button"
+            onClick={() => handleSelectPrimaryNav('leads')}
+            className="flex items-center gap-2.5 min-w-0 text-left cursor-pointer"
+          >
+            <div className="w-8 h-8 rounded-lg bg-emerald-600 text-white flex items-center justify-center shrink-0">
+              <Building2 className="w-4 h-4" />
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-base font-extrabold text-white leading-tight">
-                  {currentUser.businessName || resolvedConfig.businessName}
-                </h1>
-                <span className="bg-emerald-500/20 text-emerald-300 text-[10px] font-extrabold px-2 py-0.5 rounded border border-emerald-500/30">
-                  Client CRM
-                </span>
-              </div>
-              <p className="text-xs text-slate-400">
-                Lead Pipeline & Inquiries • Tenant ID: <span className="font-mono text-emerald-400">{activeClientId}</span>
-              </p>
-            </div>
-          </div>
+            <span className="text-sm sm:text-base font-bold text-white truncate whitespace-nowrap">
+              {activeDisplayName}
+            </span>
+          </button>
 
-          <div className="flex items-center gap-3">
-            {/* Server-Verified Root Administrator Navigation Switch */}
-            {isRootAdmin && (
-              <div className="flex items-center bg-slate-950/80 border border-slate-800 rounded-xl p-1 shadow-inner">
-                <button
-                  onClick={() => setAdminViewMode('crm')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${
-                    adminViewMode === 'crm'
-                      ? 'bg-emerald-600 text-white shadow'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                  title="View CRM Lead Pipeline for Selected Tenant"
-                >
-                  <Kanban className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">Lead Pipeline</span>
-                </button>
-                <button
-                  onClick={() => setAdminViewMode('directory')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${
-                    adminViewMode === 'directory'
-                      ? 'bg-amber-500 text-slate-950 font-black shadow'
-                      : 'text-amber-400/80 hover:text-amber-300'
-                  }`}
-                  title="View Platform Client Directory (Root Admin Only)"
-                >
-                  <Users className="w-3.5 h-3.5" />
-                  <span>Client Directory</span>
-                </button>
-              </div>
-            )}
-
-            {/* Client Owner Team Management Navigation Switch */}
-            {currentUser.role === 'client_admin' && !isVerifiedAdmin && (
-              <div className="flex items-center bg-slate-950/80 border border-slate-800 rounded-xl p-1 shadow-inner">
-                <button
-                  onClick={() => setClientViewMode('crm')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${
-                    clientViewMode === 'crm'
-                      ? 'bg-emerald-600 text-white shadow'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                  title="View Lead Pipeline"
-                >
-                  <Kanban className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">Leads</span>
-                </button>
-                <button
-                  onClick={() => setClientViewMode('team')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${
-                    clientViewMode === 'team'
-                      ? 'bg-blue-600 text-white shadow'
-                      : 'text-blue-400/80 hover:text-blue-300'
-                  }`}
-                  title="Manage Staff & Team Access"
-                >
-                  <Users className="w-3.5 h-3.5" />
-                  <span>Team Access</span>
-                </button>
-              </div>
-            )}
-
-            {/* Root Administrator Tenant Selector (in CRM view) */}
-            {isRootAdmin && adminViewMode === 'crm' && (
-              <div className="flex items-center gap-2 bg-slate-800/90 border border-amber-500/40 rounded-xl px-3 py-1.5 shadow-sm">
-                <span className="text-[11px] font-bold text-amber-400 uppercase tracking-wider hidden lg:flex items-center gap-1">
-                  <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
-                  Tenant Scope:
-                </span>
-                <select
-                  value={activeClientId}
-                  onChange={(e) => setAdminSelectedTenant(e.target.value)}
-                  className="bg-slate-900 border border-slate-700 text-xs text-white rounded-lg px-2 py-1 focus:outline-none focus:border-amber-500 cursor-pointer"
-                >
-                  {adminTenantList.map((t) => (
-                    <option key={t.tenantId} value={t.tenantId}>
-                      {t.businessName} ({t.tenantId})
-                    </option>
-                  ))}
-                  {!adminTenantList.some((t) => t.tenantId === 'demo-tarot-kochi') && (
-                    <option value="demo-tarot-kochi">Tarot Coaching & Guidance (demo-tarot-kochi)</option>
-                  )}
-                  {!adminTenantList.some((t) => t.tenantId === 'roofing-client-01') && (
-                    <option value="roofing-client-01">Test Client (roofing-client-01)</option>
-                  )}
-                  {!adminTenantList.some((t) => t.tenantId === 'client-apex-hvac') && (
-                    <option value="client-apex-hvac">Apex Heating & Cooling (client-apex-hvac)</option>
-                  )}
-                  {!adminTenantList.some((t) => t.tenantId === 'prodrain-plumbing-kochi') && (
-                    <option value="prodrain-plumbing-kochi">ProDrain Plumbing (prodrain-plumbing-kochi)</option>
-                  )}
-                  {!adminTenantList.some((t) => t.tenantId === 'demo-plumbing') && (
-                    <option value="demo-plumbing">ProDrain Plumbing (demo-plumbing)</option>
-                  )}
-                  {!adminTenantList.some((t) => t.tenantId === 'demo-skin-clinic') && (
-                    <option value="demo-skin-clinic">GlowAura Skin Clinic (demo-skin-clinic)</option>
-                  )}
-                </select>
-              </div>
-            )}
-
-            <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-300">
-              <UserCheck className="w-3.5 h-3.5 text-emerald-400" />
-              <span>{currentUser.email}</span>
-              <span className="text-[10px] bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded uppercase font-bold">
-                {isRootAdmin ? 'Root Admin' : isVerifiedAdmin ? 'Admin' : currentUser.role === 'client_staff' ? 'Staff' : 'Owner'}
-              </span>
-            </div>
-
+          {/* Zone 2: Desktop Primary Navigation (Leads, Follow-ups, More) */}
+          <nav
+            aria-label="Primary CRM Navigation"
+            className="hidden md:flex items-center gap-7 text-sm font-semibold"
+          >
             <button
-              onClick={handleLogout}
-              className="flex items-center gap-1.5 bg-slate-800 hover:bg-rose-950/40 text-slate-300 hover:text-rose-300 hover:border-rose-500/40 border border-slate-700 px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer"
-              title="Sign out of CRM"
+              type="button"
+              onClick={() => handleSelectPrimaryNav('leads')}
+              className={`py-2 border-b-2 whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                adminViewMode === 'crm' && primaryNav === 'leads'
+                  ? 'border-emerald-500 text-white'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
             >
-              <LogOut className="w-3.5 h-3.5 text-slate-400" />
-              <span>Sign Out</span>
+              Leads
             </button>
+            <button
+              type="button"
+              onClick={() => handleSelectPrimaryNav('followups')}
+              className={`py-2 border-b-2 whitespace-nowrap shrink-0 transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
+                adminViewMode === 'crm' && primaryNav === 'followups'
+                  ? 'border-emerald-500 text-white'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <span>Follow-ups</span>
+              {followUpsDueCount > 0 && (
+                <span className="text-xs font-mono text-amber-300 tabular-nums">
+                  ({followUpsDueCount})
+                </span>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSelectPrimaryNav('more')}
+              className={`py-2 border-b-2 whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                adminViewMode === 'crm' && primaryNav === 'more'
+                  ? 'border-emerald-500 text-white'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              More
+            </button>
+          </nav>
+
+          {/* Zone 3: Account Menu */}
+          <div className="relative shrink-0">
+            <button
+              type="button"
+              onClick={() => setIsAccountMenuOpen((prev) => !prev)}
+              aria-expanded={isAccountMenuOpen}
+              aria-haspopup="menu"
+              className="min-h-[40px] flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-800/80 hover:bg-slate-800 border border-slate-700/80 text-xs font-semibold text-slate-200 transition-colors whitespace-nowrap cursor-pointer"
+            >
+              <UserCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              <span className="hidden sm:inline max-w-[140px] truncate">{currentUser.email}</span>
+              <span className="sm:hidden">{roleDisplayLabel}</span>
+              <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+            </button>
+
+            {isAccountMenuOpen && (
+              <>
+                <div
+                  className="fixed inset-0 z-40"
+                  onClick={() => setIsAccountMenuOpen(false)}
+                />
+                <div
+                  role="menu"
+                  className="absolute right-0 mt-2 w-72 bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-3 z-50 space-y-3"
+                >
+                  <div className="px-2 py-1.5 border-b border-slate-800 space-y-0.5">
+                    <div className="text-xs font-semibold text-white truncate">
+                      {currentUser.email}
+                    </div>
+                    <div className="text-[11px] text-slate-400">
+                      {roleDisplayLabel} · <span className="font-mono text-slate-300">{activeClientId}</span>
+                    </div>
+                  </div>
+
+                  {/* Root Admin Controls tucked cleanly inside Account Menu */}
+                  {isRootAdmin && (
+                    <div className="space-y-2 px-2 pb-2 border-b border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAdminViewMode((prev) => (prev === 'directory' ? 'crm' : 'directory'));
+                          setIsAccountMenuOpen(false);
+                        }}
+                        className="w-full min-h-[40px] px-3 py-2 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-amber-300 text-xs font-semibold flex items-center justify-between transition-colors cursor-pointer"
+                      >
+                        <span className="inline-flex items-center gap-2">
+                          <Users className="w-3.5 h-3.5" />
+                          <span>
+                            {adminViewMode === 'directory' ? 'Back to Lead Pipeline' : 'Client Directory'}
+                          </span>
+                        </span>
+                        <ShieldCheck className="w-3.5 h-3.5" />
+                      </button>
+
+                      <div className="space-y-1">
+                        <label className="text-[11px] text-slate-400 font-medium block">
+                          Switch Tenant Scope
+                        </label>
+                        <select
+                          value={activeClientId}
+                          onChange={(e) => {
+                            setAdminSelectedTenant(e.target.value);
+                            setAdminViewMode('crm');
+                            setIsAccountMenuOpen(false);
+                          }}
+                          className="w-full min-h-[38px] bg-slate-950 border border-slate-700 text-xs text-white rounded-lg px-2.5 py-1.5 outline-none focus:border-amber-500 cursor-pointer"
+                        >
+                          {adminTenantList.map((t) => (
+                            <option key={t.tenantId} value={t.tenantId}>
+                              {t.businessName} ({t.tenantId})
+                            </option>
+                          ))}
+                          {!adminTenantList.some((t) => t.tenantId === 'demo-tarot-kochi') && (
+                            <option value="demo-tarot-kochi">Tarot Coaching & Guidance (demo-tarot-kochi)</option>
+                          )}
+                          {!adminTenantList.some((t) => t.tenantId === 'roofing-client-01') && (
+                            <option value="roofing-client-01">Test Client (roofing-client-01)</option>
+                          )}
+                          {!adminTenantList.some((t) => t.tenantId === 'client-apex-hvac') && (
+                            <option value="client-apex-hvac">Apex Heating & Cooling (client-apex-hvac)</option>
+                          )}
+                          {!adminTenantList.some((t) => t.tenantId === 'prodrain-plumbing-kochi') && (
+                            <option value="prodrain-plumbing-kochi">ProDrain Plumbing (prodrain-plumbing-kochi)</option>
+                          )}
+                          {!adminTenantList.some((t) => t.tenantId === 'demo-plumbing') && (
+                            <option value="demo-plumbing">ProDrain Plumbing (demo-plumbing)</option>
+                          )}
+                          {!adminTenantList.some((t) => t.tenantId === 'demo-skin-clinic') && (
+                            <option value="demo-skin-clinic">GlowAura Skin Clinic (demo-skin-clinic)</option>
+                          )}
+                        </select>
+                      </div>
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={handleLogout}
+                    className="w-full min-h-[40px] px-3 py-2 rounded-xl bg-slate-800/80 hover:bg-rose-950/50 text-slate-200 hover:text-rose-300 border border-slate-700/80 hover:border-rose-500/40 text-xs font-semibold flex items-center gap-2 transition-colors cursor-pointer"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                    <span>Sign Out</span>
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       </header>
 
-      {/* Main View: Root Admin Client Directory, Scoped Client Dashboard, or Tenant Staff Manager */}
+      {/* Main Content */}
       <main className="flex-1">
         {isRootAdmin && adminViewMode === 'directory' ? (
-          <SuperAdminClientDirectory
-            isRootAdmin={isRootAdmin}
-            activeSelectedTenant={activeClientId}
-            onSelectTenantScope={(tenantId) => {
-              setAdminSelectedTenant(tenantId);
-              setAdminViewMode('crm');
-            }}
-          />
-        ) : clientViewMode === 'team' && currentUser.role === 'client_admin' ? (
-          <div className="p-4 sm:p-6">
-            <TenantStaffManager
-              tenantId={activeClientId}
-              businessName={currentUser.businessName || resolvedConfig.businessName}
-              currentUserUid={currentUser.userId}
-              onClose={() => setClientViewMode('crm')}
+          <div className="pb-20 md:pb-6">
+            <SuperAdminClientDirectory
+              isRootAdmin={isRootAdmin}
+              activeSelectedTenant={activeClientId}
+              onSelectTenantScope={(tenantId) => {
+                setAdminSelectedTenant(tenantId);
+                setAdminViewMode('crm');
+              }}
             />
           </div>
         ) : (
@@ -827,9 +886,69 @@ export const StandaloneCrm: React.FC<StandaloneCrmProps> = ({ defaultClientId = 
             currentConfig={resolvedConfig}
             appMode="client"
             currentUserRole={currentUser.role}
+            currentUserUid={currentUser.userId}
+            activeNav={primaryNav}
+            onNavChange={handleSelectPrimaryNav}
+            onFollowUpsDueCountChange={setFollowUpsDueCount}
           />
         )}
       </main>
+
+      {/* Mobile Fixed Bottom Navigation Bar (Leads, Follow-ups, More) */}
+      <nav
+        aria-label="Mobile CRM Navigation"
+        className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-slate-900/95 backdrop-blur-md border-t border-slate-800 pb-safe"
+      >
+        <div className="grid grid-cols-3 h-14">
+          <button
+            type="button"
+            onClick={() => handleSelectPrimaryNav('leads')}
+            className={`min-h-[44px] flex flex-col items-center justify-center gap-0.5 transition-colors cursor-pointer ${
+              adminViewMode === 'crm' && primaryNav === 'leads'
+                ? 'text-emerald-400'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <ListChecks className="w-5 h-5" />
+            <span className="text-[11px] font-semibold tracking-tight whitespace-nowrap">Leads</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleSelectPrimaryNav('followups')}
+            className={`relative min-h-[44px] flex flex-col items-center justify-center gap-0.5 transition-colors cursor-pointer ${
+              adminViewMode === 'crm' && primaryNav === 'followups'
+                ? 'text-emerald-400'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <div className="relative">
+              <Clock className="w-5 h-5" />
+              {followUpsDueCount > 0 && (
+                <span className="absolute -top-1.5 -right-2.5 min-w-[16px] h-4 px-1 rounded-full bg-amber-500 text-slate-950 text-[10px] font-bold flex items-center justify-center tabular-nums">
+                  {followUpsDueCount > 99 ? '99+' : followUpsDueCount}
+                </span>
+              )}
+            </div>
+            <span className="text-[11px] font-semibold tracking-tight whitespace-nowrap">
+              Follow-ups
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleSelectPrimaryNav('more')}
+            className={`min-h-[44px] flex flex-col items-center justify-center gap-0.5 transition-colors cursor-pointer ${
+              adminViewMode === 'crm' && primaryNav === 'more'
+                ? 'text-emerald-400'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <SlidersHorizontal className="w-5 h-5" />
+            <span className="text-[11px] font-semibold tracking-tight whitespace-nowrap">More</span>
+          </button>
+        </div>
+      </nav>
     </div>
   );
 };

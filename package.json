@@ -13,7 +13,18 @@
     "test:security": "tsx src/tests/securityVerification.ts",
     "test:controlled": "tsx src/tests/controlledLocalTest.ts",
     "test:sheetsync": "tsx src/tests/sheetSyncTest.ts",
-    "test:appscript": "vitest run appsScriptSecurity"
+    "test:appscript": "vitest run appsScriptSecurity",
+    "test:cloudflare": "vitest run cloudflare",
+    "test:prodrain": "vitest run prodrainFixes",
+    "test:tenant": "vitest run tenantSecurityPhase1",
+    "test:phase2d": "vitest run clientOwnerStaffAccess",
+    "test:phase2d:emulator": "vitest run phase2dEmulatorIntegration",
+    "test:rules:integration": "vitest run firestoreRulesIntegration",
+    "test:routing": "vitest run clientRoutingPhase3",
+    "test:phase3b:slug": "vitest run phase3bSlugEmulatorIntegration",
+    "test:phase3b:routing": "vitest run dynamicTenantRoutingPhase3B",
+    "test:all": "npm run test:security && npm run test:controlled && npm run test:sheetsync && npm run test:appscript && npm run test:cloudflare && npm run test:prodrain && npm run test:tenant && npm run test:phase2d && npm run test:phase2d:emulator && npm run test:rules:integration && npm run test:routing && npm run test:phase3b:slug && npm run test:phase3b:routing",
+    "build:pages": "vite build"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -40,6 +51,7 @@
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.3",
+    "vite-plugin-pwa": "^2.0.0",
     "vitest": "^5.0.5"
   }
 }

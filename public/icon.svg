@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" fill="none">
+  <rect x="0" y="0" width="512" height="512" rx="108" fill="#040c1d" />
+  <path
+    d="M373 92C377 95 379 101 377 107L320 331C318 339 309 343 302 338L244 297L218 334C214 339 208 336 209 330L223 266L315 152C318 148 313 144 309 147L187 255C182 259 175 260 169 257L125 237C117 233 117 222 125 218L362 91C366 89 370 90 373 92Z"
+    fill="#ffffff"
+  />
+  <text
+    x="256"
+    y="424"
+    text-anchor="middle"
+    font-family="'Plus Jakarta Sans', 'Inter', system-ui, -apple-system, sans-serif"
+    font-size="70"
+    font-weight="800"
+    letter-spacing="-1.5"
+  >
+    <tspan fill="#ffffff">Lead</tspan><tspan fill="#01d5a8">Pilot</tspan>
+  </text>
+</svg>
